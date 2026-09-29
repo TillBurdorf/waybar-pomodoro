@@ -190,6 +190,7 @@ static void activate(GtkApplication *app, gpointer data) {
 	gtk_window_set_default_size(GTK_WINDOW(window), 320, 360);
 	gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
 	gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+  gtk_widget_set_opacity(window, 0.9);
 	gtk_widget_add_css_class(window, "pomodoro-window");
 
 	gtk_window_set_child(GTK_WINDOW(window), build_pomodoro_card());
