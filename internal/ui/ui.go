@@ -7,7 +7,11 @@ import (
 	"image/color"
 	"net"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -55,7 +59,45 @@ func (t pomodoroTheme) Color(n fyne.ThemeColorName, _ fyne.ThemeVariant) color.C
 	return t.Theme.Color(n, theme.VariantDark)
 }
 
+func getUIPidPath() string {
+	return fmt.Sprintf("/tmp/waybar-pomodoro-%d-ui.pid", os.Getuid())
+}
+
+// toggleOrAcquireSingleInstance checks if an existing UI window is already open.
+// If active, it sends SIGTERM so repeated Waybar clicks dismiss the popup cleanly.
+func toggleOrAcquireSingleInstance() (bool, error) {
+	pidPath := getUIPidPath()
+	if data, err := os.ReadFile(pidPath); err == nil {
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err == nil && pid > 0 {
+			proc, err := os.FindProcess(pid)
+			if err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err == nil {
+					_ = proc.Signal(syscall.SIGTERM)
+					return true, nil
+				}
+			}
+		}
+		_ = os.Remove(pidPath)
+	}
+
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func RunUI() error {
+	toggledOff, err := toggleOrAcquireSingleInstance()
+	if err != nil {
+		return fmt.Errorf("failed single-instance check: %w", err)
+	}
+	if toggledOff {
+		return nil
+	}
+	pidPath := getUIPidPath()
+	defer os.Remove(pidPath)
+
 	if err := ipc.EnsureDaemonRunning(); err != nil {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
@@ -68,6 +110,16 @@ func RunUI() error {
 	a.Settings().SetTheme(pomodoroTheme{theme.DefaultTheme()})
 
 	w := a.NewWindow("Pomodoro")
+	w.SetFixedSize(true)
+
+	// Dismiss window cleanly upon SIGTERM (e.g. from subsequent click or compositor)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		_ = os.Remove(pidPath)
+		a.Quit()
+	}()
 
 	// --- widgets ---
 	modeText := canvas.NewText("FOCUS 🍅", colWork)
@@ -80,16 +132,31 @@ func RunUI() error {
 	statusText.Alignment = fyne.TextAlignCenter
 
 	timerText := canvas.NewText("25:00", colWork)
-	timerText.TextSize = 52
+	timerText.TextSize = 48
 	timerText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
 	timerText.Alignment = fyne.TextAlignCenter
 
 	progress := widget.NewProgressBar()
 	progress.Min, progress.Max = 0, 1
-	progress.TextFormatter = func() string { return "" }
+	progress.TextFormatter = func() string {
+		return fmt.Sprintf("%.0f%%", progress.Value*100)
+	}
 
-	todayLabel := widget.NewLabel("0 🍅 • 0 min")
+	cycleText := canvas.NewText("○ ○ ○ ○  •  Cycle 1", colSubtext)
+	cycleText.TextSize = 12
+	cycleText.TextStyle = fyne.TextStyle{Bold: true}
+	cycleText.Alignment = fyne.TextAlignCenter
+
+	todayLabel := widget.NewLabel("Today: 0 🍅 • 0 min focus")
 	todayLabel.Alignment = fyne.TextAlignCenter
+
+	historyLabel := widget.NewLabel("Last: No sessions yet today")
+	historyLabel.Importance = widget.LowImportance
+	historyLabel.Alignment = fyne.TextAlignCenter
+
+	helpLabel := canvas.NewText("[Space] Toggle  •  [S] Skip  •  [R] Reset  •  [X] Stop", colSubtext)
+	helpLabel.TextSize = 9
+	helpLabel.Alignment = fyne.TextAlignCenter
 
 	send := func(cmd string) {
 		go func() { _ = ipc.SendCommand(cmd) }()
@@ -97,21 +164,32 @@ func RunUI() error {
 
 	toggleBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() { send("toggle") })
 	toggleBtn.Importance = widget.HighImportance
+
 	skipBtn := widget.NewButtonWithIcon("", theme.MediaSkipNextIcon(), func() { send("skip") })
 	resetBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() { send("reset") })
+
+	stopBtn := widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() { send("stop") })
+	stopBtn.Importance = widget.DangerImportance
+
+	buttonGrid := container.NewGridWithColumns(4, toggleBtn, skipBtn, resetBtn, stopBtn)
 
 	content := container.NewVBox(
 		modeText,
 		statusText,
 		timerText,
 		progress,
+		cycleText,
+		widget.NewSeparator(),
 		todayLabel,
-		container.NewGridWithColumns(3, toggleBtn, skipBtn, resetBtn),
+		historyLabel,
+		widget.NewSeparator(),
+		buttonGrid,
+		helpLabel,
 	)
 	w.SetContent(container.NewPadded(content))
 	w.Resize(fyne.NewSize(320, 360))
 
-	// --- keyboard shortcuts (same keys as the TUI) ---
+	// --- keyboard shortcuts ---
 	w.Canvas().SetOnTypedKey(func(e *fyne.KeyEvent) {
 		switch e.Name {
 		case fyne.KeySpace:
@@ -126,12 +204,14 @@ func RunUI() error {
 			send("skip")
 		case 'r', 'R':
 			send("reset")
+		case 'x', 'X':
+			send("stop")
 		case 'q', 'Q':
 			a.Quit()
 		}
 	})
 
-	// --- state rendering (must run on the UI thread) ---
+	// --- state rendering ---
 	apply := func(state waybar.Output, summary stats.StatsSummary) {
 		mc := colWork
 		modeName := "FOCUS 🍅"
@@ -171,13 +251,43 @@ func RunUI() error {
 		}
 		progress.SetValue(float64(elapsed) / float64(total))
 
-		todayLabel.SetText(fmt.Sprintf("%d 🍅 • %d min", summary.TodayCount, summary.TodayMinutes))
+		// Cycle indicator (4 intervals per round)
+		cycleNum := (summary.TodayCount / 4) + 1
+		pos := summary.TodayCount % 4
+		var dots strings.Builder
+		for i := 0; i < 4; i++ {
+			if i < pos {
+				dots.WriteString("🍅 ")
+			} else {
+				dots.WriteString("○ ")
+			}
+		}
+		cycleText.Text = fmt.Sprintf("%s •  Cycle %d", strings.TrimSpace(dots.String()), cycleNum)
+		cycleText.Refresh()
+
+		todayLabel.SetText(fmt.Sprintf("Today: %d 🍅 • %d min focus", summary.TodayCount, summary.TodayMinutes))
+
+		if len(summary.RecentHistory) > 0 {
+			rec := summary.RecentHistory[0]
+			modeDesc := "Focus"
+			if rec.Mode == "break" {
+				modeDesc = "Break"
+			}
+			historyLabel.SetText(fmt.Sprintf("Last: %s • %s (%d min)", rec.Timestamp.Local().Format("15:04"), modeDesc, rec.Duration/60))
+		} else {
+			historyLabel.SetText("Last: No sessions yet today")
+		}
 	}
 
 	// --- daemon subscription ---
 	done := make(chan struct{})
 	var once sync.Once
-	stop := func() { once.Do(func() { close(done) }) }
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			_ = os.Remove(pidPath)
+		})
+	}
 	w.SetOnClosed(stop)
 
 	updateChan := make(chan waybar.Output, 16)
@@ -231,7 +341,6 @@ func subscribeToDaemon(outChan chan<- waybar.Output, done <-chan struct{}) {
 			continue
 		}
 
-		// Close the connection when the window closes so Scan unblocks.
 		go func() {
 			<-done
 			conn.Close()
