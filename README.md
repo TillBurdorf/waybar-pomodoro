@@ -1,6 +1,6 @@
 # Waybar Pomodoro 🍅
 
-A lightweight, daemon-driven Pomodoro timer built in Go specifically for **Waybar** on Linux (Wayland). It features real-time Unix socket IPC, desktop notifications, session history logging, and a dedicated graphical control popup styled with Catppuccin Mocha.
+A lightweight, daemon-driven Pomodoro timer built in Go specifically for **Waybar** on Linux (Wayland). It features real-time Unix socket IPC, desktop notifications, session history logging, and a dedicated GTK4 control popup styled with Catppuccin Mocha.
 
 ---
 
@@ -9,7 +9,7 @@ A lightweight, daemon-driven Pomodoro timer built in Go specifically for **Wayba
 - ⚡ **Zero-Polling Daemon**: Runs a background daemon that broadcasts timer updates over a local Unix domain socket directly to Waybar.
 - 🍅 **25 / 5 Cycle**: 25-minute focus sessions followed by 5-minute short breaks.
 - 🔔 **Desktop Notifications**: Automatic alerts via `notify-send` when sessions or breaks conclude.
-- 🖥️ **Native GUI Control Panel**: Sleek floating window built with [Fyne](https://fyne.io) featuring a live countdown, progress bar, today's focus stats, and media controls.
+- 🖥️ **Native GTK4 GUI Control Panel**: Sleek floating window built with GTK4 featuring a live countdown, progress bar, today's focus stats, and media controls.
 - 📊 **Session Logging & History**: Automatically tracks completed sessions in `~/.local/share/waybar-pomodoro/stats.jsonl`.
 - ⌨️ **Full CLI Control**: Simple CLI commands to toggle, skip, reset, or query stats from keybindings or scripts.
 
@@ -18,10 +18,10 @@ A lightweight, daemon-driven Pomodoro timer built in Go specifically for **Wayba
 ## Prerequisites
 
 - **Go**: 1.21 or newer
-- **C Compiler & Graphics Libraries** (required by Fyne for Wayland/OpenGL):
-  - **Arch Linux**: `sudo pacman -S base-devel libxcursor libxrandr libxinerama libxi libglvnd wayland`
-  - **Fedora**: `sudo dnf install gcc libXcursor-devel libXrandr-devel libXinerama-devel libXi-devel libglvnd-devel wayland-devel`
-  - **Debian / Ubuntu**: `sudo apt install build-essential libgl1-mesa-dev xorg-dev libwayland-dev`
+- **GTK 4 development files**:
+  - **Arch Linux**: `gtk4`
+  - **Fedora**: `gtk4-devel`
+  - **Debian / Ubuntu**: `libgtk-4-dev`
 - **Notification Daemon**: `libnotify` (`notify-send`)
 
 ---
@@ -47,12 +47,12 @@ Because tiling compositors automatically tile new windows to fill screen space, 
 ### Hyprland
 
 #### Standard Configuration (`hyprland.conf`)
-Add the following rules to `~/.config/hypr/hyprland.conf`:
+Add the following rule to `~/.config/hypr/hyprland.conf`:
 
 ```ini
-windowrulev2 = float, class:^(waybar-pomodoro)$
-windowrulev2 = size 320 360, class:^(waybar-pomodoro)$
-windowrulev2 = center, class:^(waybar-pomodoro)$
+windowrulev2 = float, class:^(io.github.waybarpomodoro.gtk)$
+windowrulev2 = center, class:^(io.github.waybarpomodoro.gtk)$
+windowrulev2 = size 320 360, class:^(io.github.waybarpomodoro.gtk)$
 ```
 
 #### Lua Configuration (`looknfeel.lua` / `hyprland.lua`)
@@ -60,7 +60,7 @@ If using Hyprland with Lua configuration:
 
 ```lua
 hl.window_rule({
-    match = { class = "^waybar-pomodoro$" },
+    match = { class = "^io.github.waybarpomodoro.gtk$" },
     float = true,
     center = true,
     size = { 320, 360 },
@@ -74,7 +74,7 @@ hl.window_rule({
 Add the following to your Sway/i3 configuration (`~/.config/sway/config`):
 
 ```
-for_window [app_id="waybar-pomodoro"] floating enable, resize set 320 360, move position center
+for_window [app_id="io.github.waybarpomodoro.gtk"] floating enable, move position center
 ```
 
 ---
@@ -125,7 +125,7 @@ You can style the module based on its status classes:
 
 | Command | Description |
 | :--- | :--- |
-| `waybar-pomodoro ui` | Opens the graphical Fyne control dashboard |
+| `waybar-pomodoro ui` | Opens or toggles the GTK4 control dashboard |
 | `waybar-pomodoro dev` | Launches standalone mock UI with test hotkeys |
 | `waybar-pomodoro waybar` | Streams JSON status updates directly for Waybar |
 | `waybar-pomodoro toggle` | Starts or pauses the active countdown |
@@ -139,19 +139,18 @@ You can style the module based on its status classes:
 
 ## UI Development & Live Preview
 
-To edit the UI with instant live-reloading:
+To test and develop the GTK4 UI with instant live-reloading:
 
 ```bash
 make dev
 ```
 
-This starts a file watcher (using [air](https://github.com/air-verse/air) or a fallback watcher) that monitors `internal/` and `cmd/`. Every time you save changes to the UI code:
-- The preview window is immediately rebuilt and refreshed (~0.5s).
-- **Zero-downtime error resilience**: If you introduce a syntax or build error while editing, the window **never closes or collapses your Hyprland layout**. The existing preview stays open (or displays the compiler error) until you save your fix.
+This starts [air](https://github.com/air-verse/air) to watch for file changes in `internal/ui/` and `cmd/`. Every time you save changes to the Go or GTK code:
+- The preview window is immediately rebuilt and refreshed (<0.5s).
 - It runs with mock data, so you don't need the background daemon running.
 - **Interactive Preview Keys**:
   - `M`: Toggle between Focus 🍅 and Break ☕ themes
-  - `P`: Cycle progress bar (0% → 50% → 75% → 99%)
+  - `P`: Cycle progress bar (100% → 50% → 25% → 5%)
   - `C`: Cycle completed session dot counts
   - `+` / `-`: Add or subtract 1 minute
   - `Space`: Run / pause local simulated countdown

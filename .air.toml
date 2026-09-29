@@ -1,0 +1,20 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/waybar-pomodoro ./cmd/waybar-pomodoro"
+  entrypoint = ["./tmp/waybar-pomodoro", "dev"]
+  args_bin = ["dev"]
+  include_ext = ["go", "c", "h"]
+  exclude_dir = ["tmp", ".git"]
+  delay = 200
+  stop_on_error = true
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[log]
+  time = false

@@ -23,7 +23,7 @@ func main() {
 		timer.RunDaemon()
 	case "waybar":
 		timer.RunClient()
-	case "ui":
+	case "ui", "gtk-ui":
 		if err := ui.RunUI(); err != nil {
 			fmt.Println("Error:", err)
 			os.Exit(1)
@@ -49,5 +49,5 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Usage: waybar-pomodoro <waybar|ui|toggle|stop|reset|skip|stats|daemon>")
+	fmt.Println("Usage: waybar-pomodoro <waybar|ui|dev|toggle|stop|reset|skip|stats|daemon>")
 }

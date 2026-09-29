@@ -1,4 +1,4 @@
-.PHONY: build install clean
+.PHONY: build install dev clean
 
 build:
 	go build -o waybar-pomodoro ./cmd/waybar-pomodoro
