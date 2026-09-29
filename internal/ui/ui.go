@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image/color"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -60,12 +60,14 @@ func RunUI() error {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 
+	if os.Getenv("FYNE_SCALE") == "" {
+		_ = os.Setenv("FYNE_SCALE", "1")
+	}
+
 	a := app.NewWithID("waybar-pomodoro")
 	a.Settings().SetTheme(pomodoroTheme{theme.DefaultTheme()})
 
 	w := a.NewWindow("Pomodoro")
-	w.SetFixedSize(true)
-	w.CenterOnScreen()
 
 	// --- widgets ---
 	modeText := canvas.NewText("FOCUS 🍅", colWork)
@@ -107,6 +109,7 @@ func RunUI() error {
 		container.NewGridWithColumns(3, toggleBtn, skipBtn, resetBtn),
 	)
 	w.SetContent(container.NewPadded(content))
+	w.Resize(fyne.NewSize(320, 360))
 
 	// --- keyboard shortcuts (same keys as the TUI) ---
 	w.Canvas().SetOnTypedKey(func(e *fyne.KeyEvent) {
@@ -202,15 +205,6 @@ func RunUI() error {
 			}
 		}
 	}()
-
-	// Optional system tray menu (when the desktop supports it)
-	if desk, ok := a.(desktop.App); ok {
-		desk.SetSystemTrayMenu(fyne.NewMenu("Pomodoro",
-			fyne.NewMenuItem("Toggle", func() { send("toggle") }),
-			fyne.NewMenuItem("Skip", func() { send("skip") }),
-			fyne.NewMenuItem("Reset", func() { send("reset") }),
-		))
-	}
 
 	w.ShowAndRun()
 	stop()
