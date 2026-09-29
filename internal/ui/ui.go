@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"image/color"
 	"net"
 	"os"
 	"os/signal"
@@ -16,48 +15,15 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
 
 	"waybar-pomodoro/internal/ipc"
 	"waybar-pomodoro/internal/stats"
 	"waybar-pomodoro/internal/waybar"
 )
 
-// Catppuccin Mocha palette
-var (
-	colBase     = color.NRGBA{30, 30, 46, 255}
-	colSurface0 = color.NRGBA{49, 50, 68, 255}
-	colSurface1 = color.NRGBA{69, 71, 90, 255}
-	colText     = color.NRGBA{205, 214, 244, 255}
-	colSubtext  = color.NRGBA{147, 153, 178, 255}
-	colBlue     = color.NRGBA{137, 180, 250, 255}
-	colWork     = color.NRGBA{243, 139, 168, 255}
-	colBreak    = color.NRGBA{166, 227, 161, 255}
-	colPaused   = color.NRGBA{249, 226, 175, 255}
-)
 
-type pomodoroTheme struct{ fyne.Theme }
-
-func (t pomodoroTheme) Color(n fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
-	switch n {
-	case theme.ColorNameBackground:
-		return colBase
-	case theme.ColorNameForeground:
-		return colText
-	case theme.ColorNamePrimary:
-		return colBlue
-	case theme.ColorNameButton, theme.ColorNameInputBackground:
-		return colSurface0
-	case theme.ColorNameDisabled, theme.ColorNamePlaceHolder:
-		return colSubtext
-	case theme.ColorNameSeparator:
-		return colSurface1
-	}
-	return t.Theme.Color(n, theme.VariantDark)
-}
 
 func getUIPidPath() string {
 	return fmt.Sprintf("/tmp/waybar-pomodoro-%d-ui.pid", os.Getuid())
@@ -121,72 +87,12 @@ func RunUI() error {
 		a.Quit()
 	}()
 
-	// --- widgets ---
-	modeText := canvas.NewText("FOCUS 🍅", colWork)
-	modeText.TextSize = 13
-	modeText.TextStyle = fyne.TextStyle{Bold: true}
-	modeText.Alignment = fyne.TextAlignCenter
-
-	statusText := canvas.NewText("⏸ Paused", colPaused)
-	statusText.TextSize = 11
-	statusText.Alignment = fyne.TextAlignCenter
-
-	timerText := canvas.NewText("25:00", colWork)
-	timerText.TextSize = 48
-	timerText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-	timerText.Alignment = fyne.TextAlignCenter
-
-	progress := widget.NewProgressBar()
-	progress.Min, progress.Max = 0, 1
-	progress.TextFormatter = func() string {
-		return fmt.Sprintf("%.0f%%", progress.Value*100)
-	}
-
-	cycleText := canvas.NewText("○ ○ ○ ○  •  Cycle 1", colSubtext)
-	cycleText.TextSize = 12
-	cycleText.TextStyle = fyne.TextStyle{Bold: true}
-	cycleText.Alignment = fyne.TextAlignCenter
-
-	todayLabel := widget.NewLabel("Today: 0 🍅 • 0 min focus")
-	todayLabel.Alignment = fyne.TextAlignCenter
-
-	historyLabel := widget.NewLabel("Last: No sessions yet today")
-	historyLabel.Importance = widget.LowImportance
-	historyLabel.Alignment = fyne.TextAlignCenter
-
-	helpLabel := canvas.NewText("[Space] Toggle  •  [S] Skip  •  [R] Reset  •  [X] Stop", colSubtext)
-	helpLabel.TextSize = 9
-	helpLabel.Alignment = fyne.TextAlignCenter
-
 	send := func(cmd string) {
 		go func() { _ = ipc.SendCommand(cmd) }()
 	}
 
-	toggleBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() { send("toggle") })
-	toggleBtn.Importance = widget.HighImportance
-
-	skipBtn := widget.NewButtonWithIcon("", theme.MediaSkipNextIcon(), func() { send("skip") })
-	resetBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() { send("reset") })
-
-	stopBtn := widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() { send("stop") })
-	stopBtn.Importance = widget.DangerImportance
-
-	buttonGrid := container.NewGridWithColumns(4, toggleBtn, skipBtn, resetBtn, stopBtn)
-
-	content := container.NewVBox(
-		modeText,
-		statusText,
-		timerText,
-		progress,
-		cycleText,
-		widget.NewSeparator(),
-		todayLabel,
-		historyLabel,
-		widget.NewSeparator(),
-		buttonGrid,
-		helpLabel,
-	)
-	w.SetContent(container.NewPadded(content))
+	view := BuildView(send)
+	w.SetContent(container.NewPadded(view.Content))
 	w.Resize(fyne.NewSize(320, 360))
 
 	// --- keyboard shortcuts ---
@@ -211,73 +117,7 @@ func RunUI() error {
 		}
 	})
 
-	// --- state rendering ---
-	apply := func(state waybar.Output, summary stats.StatsSummary) {
-		mc := colWork
-		modeName := "FOCUS 🍅"
-		if state.Mode == "break" {
-			mc = colBreak
-			modeName = "BREAK ☕"
-		}
-		modeText.Text, modeText.Color = modeName, mc
-		modeText.Refresh()
-
-		if state.Running {
-			statusText.Text, statusText.Color = "● Running", colBreak
-			toggleBtn.SetIcon(theme.MediaPauseIcon())
-		} else {
-			statusText.Text, statusText.Color = "⏸ Paused", colPaused
-			toggleBtn.SetIcon(theme.MediaPlayIcon())
-		}
-		statusText.Refresh()
-
-		timerText.Text = fmt.Sprintf("%02d:%02d", state.Remaining/60, state.Remaining%60)
-		timerText.Color = mc
-		timerText.Refresh()
-
-		total := state.Total
-		if total <= 0 {
-			if state.Mode == "break" {
-				total = 5 * 60
-			} else {
-				total = 25 * 60
-			}
-		}
-		elapsed := total - state.Remaining
-		if elapsed < 0 {
-			elapsed = 0
-		} else if elapsed > total {
-			elapsed = total
-		}
-		progress.SetValue(float64(elapsed) / float64(total))
-
-		// Cycle indicator (4 intervals per round)
-		cycleNum := (summary.TodayCount / 4) + 1
-		pos := summary.TodayCount % 4
-		var dots strings.Builder
-		for i := 0; i < 4; i++ {
-			if i < pos {
-				dots.WriteString("🍅 ")
-			} else {
-				dots.WriteString("○ ")
-			}
-		}
-		cycleText.Text = fmt.Sprintf("%s •  Cycle %d", strings.TrimSpace(dots.String()), cycleNum)
-		cycleText.Refresh()
-
-		todayLabel.SetText(fmt.Sprintf("Today: %d 🍅 • %d min focus", summary.TodayCount, summary.TodayMinutes))
-
-		if len(summary.RecentHistory) > 0 {
-			rec := summary.RecentHistory[0]
-			modeDesc := "Focus"
-			if rec.Mode == "break" {
-				modeDesc = "Break"
-			}
-			historyLabel.SetText(fmt.Sprintf("Last: %s • %s (%d min)", rec.Timestamp.Local().Format("15:04"), modeDesc, rec.Duration/60))
-		} else {
-			historyLabel.SetText("Last: No sessions yet today")
-		}
-	}
+	apply := view.Apply
 
 	// --- daemon subscription ---
 	done := make(chan struct{})

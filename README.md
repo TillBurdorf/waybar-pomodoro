@@ -126,6 +126,7 @@ You can style the module based on its status classes:
 | Command | Description |
 | :--- | :--- |
 | `waybar-pomodoro ui` | Opens the graphical Fyne control dashboard |
+| `waybar-pomodoro dev` | Launches standalone mock UI with test hotkeys |
 | `waybar-pomodoro waybar` | Streams JSON status updates directly for Waybar |
 | `waybar-pomodoro toggle` | Starts or pauses the active countdown |
 | `waybar-pomodoro skip` | Skips to the next phase (Work ⇄ Break) |
@@ -133,6 +134,29 @@ You can style the module based on its status classes:
 | `waybar-pomodoro stop` | Stops the timer and resets back to Work phase (25:00) |
 | `waybar-pomodoro stats` | Displays today's completed session count and total focus time |
 | `waybar-pomodoro daemon` | Runs the timer server in the foreground |
+
+---
+
+## UI Development & Live Preview
+
+To edit the UI with instant live-reloading:
+
+```bash
+make dev
+```
+
+This starts a file watcher (using [air](https://github.com/air-verse/air) or a fallback watcher) that monitors `internal/` and `cmd/`. Every time you save changes to the UI code:
+- The preview window is immediately rebuilt and refreshed (~0.5s).
+- **Zero-downtime error resilience**: If you introduce a syntax or build error while editing, the window **never closes or collapses your Hyprland layout**. The existing preview stays open (or displays the compiler error) until you save your fix.
+- It runs with mock data, so you don't need the background daemon running.
+- **Interactive Preview Keys**:
+  - `M`: Toggle between Focus 🍅 and Break ☕ themes
+  - `P`: Cycle progress bar (0% → 50% → 75% → 99%)
+  - `C`: Cycle completed session dot counts
+  - `+` / `-`: Add or subtract 1 minute
+  - `Space`: Run / pause local simulated countdown
+  - `S` / `R` / `X`: Test Skip, Reset, and Stop actions
+  - `Q` / `Esc`: Exit preview
 
 ---
 

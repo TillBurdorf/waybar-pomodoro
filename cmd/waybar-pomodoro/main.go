@@ -38,6 +38,11 @@ func main() {
 			fmt.Println("Error showing stats:", err)
 			os.Exit(1)
 		}
+	case "dev":
+		if err := ui.RunDevUI(); err != nil {
+			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
 	default:
 		printUsage()
 	}
