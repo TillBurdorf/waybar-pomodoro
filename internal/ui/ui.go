@@ -16,7 +16,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/theme"
 
 	"waybar-pomodoro/internal/ipc"
 	"waybar-pomodoro/internal/stats"
@@ -73,7 +72,7 @@ func RunUI() error {
 	}
 
 	a := app.NewWithID("waybar-pomodoro")
-	a.Settings().SetTheme(pomodoroTheme{theme.DefaultTheme()})
+	a.Settings().SetTheme(NewMochaTheme())
 
 	w := a.NewWindow("Pomodoro")
 	w.SetFixedSize(true)

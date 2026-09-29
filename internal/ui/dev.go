@@ -15,7 +15,6 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"waybar-pomodoro/internal/stats"
@@ -59,7 +58,7 @@ func RunDevUI() error {
 	}
 
 	a := app.NewWithID("waybar-pomodoro-dev")
-	a.Settings().SetTheme(pomodoroTheme{theme.DefaultTheme()})
+	a.Settings().SetTheme(NewMochaTheme())
 
 	w := a.NewWindow("Pomodoro [DEV PREVIEW]")
 

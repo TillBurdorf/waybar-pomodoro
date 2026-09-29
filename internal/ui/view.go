@@ -7,6 +7,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -76,19 +77,26 @@ func BuildView(send func(string)) *View {
 
 	buttonGrid := container.NewGridWithColumns(4, toggleBtn, skipBtn, resetBtn, stopBtn)
 
-	content := container.NewPadded(container.NewVBox(
-		modeText,
-		timerText,
-		statusText,
-		bar,
-		dotRow,
-		cycleText,
-		widget.NewSeparator(),
-		todayText,
-		historyText,
-		widget.NewSeparator(),
-		buttonGrid,
-	))
+	content := container.New(
+		layout.NewCustomPaddedLayout(6, 6, 12, 12),
+		container.NewVBox(
+			layout.NewSpacer(),
+			modeText,
+			timerText,
+			statusText,
+			bar,
+			dotRow,
+			cycleText,
+			layout.NewSpacer(),
+			widget.NewSeparator(),
+			todayText,
+			historyText,
+			widget.NewSeparator(),
+			layout.NewSpacer(),
+			buttonGrid,
+			layout.NewSpacer(),
+		),
+	)
 
 	apply := func(state waybar.Output, summary stats.StatsSummary) {
 		mc, modeName := colWork, "FOCUS"
