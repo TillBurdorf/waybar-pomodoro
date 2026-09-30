@@ -3,8 +3,21 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <dlfcn.h>
 
 #include "gtk_ui.h"
+
+typedef GtkWidget *(*DevBuildCardFn)(void);
+typedef void (*DevReloadCssFn)(void);
+typedef void (*DevUpdateFn)(const char *, const char *, const char *, const char *, const char *, const char *, const char *, double);
+typedef void (*DevUpdateStatsFn)(const char *, const char *, const char *, const char *);
+typedef gboolean (*DevKeyFn)(GtkEventControllerKey *, guint, guint, GdkModifierType, gpointer);
+
+static void *current_dev_module_handle = NULL;
+static DevUpdateFn active_update_fn = NULL;
+static DevUpdateStatsFn active_update_stats_fn = NULL;
+static DevKeyFn active_key_dev_fn = NULL;
+static GtkWidget *dev_card_frame = NULL;
 
 static GtkApplication *application;
 static GtkLabel *mode_label;
@@ -187,6 +200,10 @@ static gboolean apply_update(gpointer data) {
 void pom_gtk_update(const char *mode, const char *timer, const char *status,
                     const char *progress, const char *cycle,
                     const char *stats, const char *history, double fraction) {
+    if (active_update_fn != NULL) {
+        active_update_fn(mode, timer, status, progress, cycle, stats, history, fraction);
+        return;
+    }
     UIUpdate *update = g_new0(UIUpdate, 1);
     update->mode = g_strdup(mode);
     update->timer = g_strdup(timer);
@@ -361,6 +378,10 @@ static gboolean apply_stats_update(gpointer data) {
 
 void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_data,
                           const char *week_summary, const char *week_days_data) {
+    if (active_update_stats_fn != NULL) {
+        active_update_stats_fn(today_summary, today_blocks_data, week_summary, week_days_data);
+        return;
+    }
     StatsUpdate *up = g_new0(StatsUpdate, 1);
     up->today_summary = g_strdup(today_summary);
     up->today_blocks = g_strdup(today_blocks_data);
@@ -782,7 +803,7 @@ static void on_stack_visible_child_changed(GObject *gobject, GParamSpec *pspec, 
 }
 
 /* Tabbed Popup Container */
-static GtkWidget *build_pomodoro_card(void) {
+GtkWidget *build_pomodoro_card(void) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_add_css_class(box, "popup-content");
     gtk_widget_set_size_request(box, 320, 380);
@@ -966,8 +987,11 @@ static gboolean key_pressed(GtkEventControllerKey *controller, guint keyval,
     }
 }
 
-static gboolean key_pressed_dev(GtkEventControllerKey *controller, guint keyval,
-                                guint keycode, GdkModifierType state, gpointer data) {
+gboolean key_pressed_dev(GtkEventControllerKey *controller, guint keyval,
+                        guint keycode, GdkModifierType state, gpointer data) {
+    if (active_key_dev_fn != NULL) {
+        return active_key_dev_fn(controller, keyval, keycode, state, data);
+    }
     (void)keycode;
     (void)data;
     if (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) {
@@ -1112,6 +1136,7 @@ static void activate_dev(GtkApplication *app, gpointer data) {
 
     GtkWidget *card_frame = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(card_frame, "card-preview");
+    dev_card_frame = card_frame;
 
     GtkWidget *card = build_pomodoro_card();
     if (card != NULL) {
@@ -1141,9 +1166,7 @@ static void activate_dev(GtkApplication *app, gpointer data) {
     gtk_window_present(GTK_WINDOW(window));
 }
 
-static void on_startup(GApplication *app, gpointer data) {
-    (void)app;
-    (void)data;
+void pom_gtk_reload_css(void) {
     static const char css[] =
         "window.pomodoro-window { background: #1e1e2e; color: #cdd6f4; }"
         "window.pomodoro-dev-window { background: #11111b; color: #cdd6f4; }"
@@ -1206,6 +1229,97 @@ static void on_startup(GApplication *app, gpointer data) {
                                                    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
     g_object_unref(provider);
+}
+
+static void on_startup(GApplication *app, gpointer data) {
+    (void)app;
+    (void)data;
+    pom_gtk_reload_css();
+}
+
+static gboolean show_compile_error_idle(gpointer data) {
+    char *err = (char *)data;
+    if (dev_error_label != NULL && dev_error_box != NULL) {
+        char formatted[600];
+        snprintf(formatted, sizeof(formatted), "⚠️ %s", err ? err : "Build Error");
+        gtk_label_set_text(GTK_LABEL(dev_error_label), formatted);
+        gtk_widget_set_visible(dev_error_box, TRUE);
+    }
+    g_free(err);
+    return G_SOURCE_REMOVE;
+}
+
+void pom_gtk_dev_show_compile_error(const char *error_msg) {
+    g_idle_add(show_compile_error_idle, g_strdup(error_msg));
+}
+
+static gboolean clear_compile_error_idle(gpointer data) {
+    (void)data;
+    if (dev_error_box != NULL) {
+        gtk_widget_set_visible(dev_error_box, FALSE);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+void pom_gtk_dev_clear_compile_error(void) {
+    g_idle_add(clear_compile_error_idle, NULL);
+}
+
+static gboolean apply_module_reload_idle(gpointer data) {
+    char *so_path = (char *)data;
+    void *h = dlopen(so_path, RTLD_NOW | RTLD_GLOBAL);
+    if (!h) {
+        const char *err = dlerror();
+        pom_gtk_dev_show_compile_error(err ? err : "Failed to load module");
+        g_free(so_path);
+        return G_SOURCE_REMOVE;
+    }
+
+    DevBuildCardFn build_card = (DevBuildCardFn)dlsym(h, "build_pomodoro_card");
+    if (!build_card) {
+        pom_gtk_dev_show_compile_error("Missing build_pomodoro_card in module");
+        dlclose(h);
+        g_free(so_path);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (dev_error_box != NULL) {
+        gtk_widget_set_visible(dev_error_box, FALSE);
+    }
+
+    DevReloadCssFn reload_css = (DevReloadCssFn)dlsym(h, "pom_gtk_reload_css");
+    if (reload_css) {
+        reload_css();
+    }
+
+    if (dev_card_frame != NULL) {
+        GtkWidget *child = gtk_widget_get_first_child(dev_card_frame);
+        while (child != NULL) {
+            GtkWidget *next = gtk_widget_get_next_sibling(child);
+            gtk_box_remove(GTK_BOX(dev_card_frame), child);
+            child = next;
+        }
+
+        GtkWidget *new_card = build_card();
+        if (new_card != NULL) {
+            gtk_box_append(GTK_BOX(dev_card_frame), new_card);
+        }
+    }
+
+    active_update_fn = (DevUpdateFn)dlsym(h, "pom_gtk_update");
+    active_update_stats_fn = (DevUpdateStatsFn)dlsym(h, "pom_gtk_update_stats");
+    active_key_dev_fn = (DevKeyFn)dlsym(h, "key_pressed_dev");
+
+    current_dev_module_handle = h;
+    g_free(so_path);
+
+    goGTKDevAction("refresh_state");
+
+    return G_SOURCE_REMOVE;
+}
+
+void pom_gtk_dev_load_module(const char *so_path) {
+    g_idle_add(apply_module_reload_idle, g_strdup(so_path));
 }
 
 static gboolean quit_application(gpointer data) {

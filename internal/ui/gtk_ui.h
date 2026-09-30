@@ -11,6 +11,10 @@ void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_da
 void pom_gtk_quit_async(void);
 void pom_gtk_set_initial_durations(int work_min, int break_min);
 void pom_gtk_dev_show_fallback_error(const char *error_msg);
+void pom_gtk_dev_load_module(const char *so_path);
+void pom_gtk_dev_show_compile_error(const char *error_msg);
+void pom_gtk_dev_clear_compile_error(void);
+void pom_gtk_reload_css(void);
 
 extern void goGTKCommand(char *command);
 extern void goGTKDevAction(char *action);

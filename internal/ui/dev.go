@@ -2,6 +2,7 @@ package ui
 
 /*
 #cgo pkg-config: gtk4
+#cgo LDFLAGS: -ldl
 #include <stdlib.h>
 #include "gtk_ui.h"
 */
@@ -9,8 +10,15 @@ import "C"
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -146,18 +154,99 @@ func (s *devState) handleAction(action string) {
 		if s.output.Remaining > 60 {
 			s.output.Remaining -= 60
 		}
+	case "refresh_state":
+		// In-place UI reload: re-apply current output & summary to new card widgets
 	}
 
 	updateGTK(s.output, s.summary)
 }
 
+func getDevPidPath() string {
+	return fmt.Sprintf("/tmp/waybar-pomodoro-%d-dev.pid", os.Getuid())
+}
+
+func ensureSingleDevInstance() (func(), error) {
+	currentPid := os.Getpid()
+
+	// 1. Check PID file first
+	pidPath := getDevPidPath()
+	if data, err := os.ReadFile(pidPath); err == nil {
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err == nil && pid > 0 && pid != currentPid {
+			if proc, err := os.FindProcess(pid); err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err == nil {
+					_ = proc.Signal(syscall.SIGTERM)
+				}
+			}
+		}
+		_ = os.Remove(pidPath)
+	}
+
+	// 2. Also scan /proc for any other running dev preview processes
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid == currentPid {
+				continue
+			}
+			cmdlineBytes, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+			if err != nil {
+				continue
+			}
+			cmdline := string(cmdlineBytes)
+			if strings.Contains(cmdline, "waybar-pomodoro") && strings.Contains(cmdline, "dev") {
+				if proc, err := os.FindProcess(pid); err == nil {
+					if err := proc.Signal(syscall.Signal(0)); err == nil {
+						_ = proc.Signal(syscall.SIGTERM)
+					}
+				}
+			}
+		}
+	}
+
+	// Wait briefly for previous instances to terminate
+	time.Sleep(50 * time.Millisecond)
+
+	// Write current PID
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(currentPid)), 0o600); err != nil {
+		return func() {}, err
+	}
+
+	cleanup := func() {
+		_ = os.Remove(pidPath)
+	}
+	return cleanup, nil
+}
+
 // RunDevUI launches an isolated mock UI dev preview with interactive test keys.
 func RunDevUI() error {
+	cleanup, err := ensureSingleDevInstance()
+	if err != nil {
+		return fmt.Errorf("failed dev single-instance check: %w", err)
+	}
+	defer cleanup()
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	done := make(chan struct{})
-	defer close(done)
+	var once sync.Once
+	stop := func() { once.Do(func() { close(done) }) }
+	defer stop()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		select {
+		case <-signals:
+			C.pom_gtk_quit_async()
+		case <-done:
+		}
+	}()
 
 	// Initial render
 	currentDevState.mu.Lock()
@@ -201,7 +290,11 @@ func RunDevUI() error {
 		}
 	}()
 
+	// Live hot-reload watcher for UI edits (in-place swap without destroying the Wayland window)
+	go watchAndHotReloadUI(done)
+
 	status := C.pom_gtk_dev_run()
+	stop()
 	if status != 0 {
 		errMsg := fmt.Sprintf("GTK dev application exited with status %d", int(status))
 		cMsg := C.CString(errMsg)
@@ -210,4 +303,91 @@ func RunDevUI() error {
 		return fmt.Errorf("%s", errMsg)
 	}
 	return nil
+}
+
+func findModuleRoot() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "."
+}
+
+func watchAndHotReloadUI(done <-chan struct{}) {
+	root := findModuleRoot()
+	targetPath := filepath.Join(root, "internal/ui/gtk_ui.c")
+	headerPath := filepath.Join(root, "internal/ui/gtk_ui.h")
+
+	getLatestMod := func() time.Time {
+		var latest time.Time
+		for _, p := range []string{targetPath, headerPath} {
+			if info, err := os.Stat(p); err == nil {
+				if info.ModTime().After(latest) {
+					latest = info.ModTime()
+				}
+			}
+		}
+		return latest
+	}
+
+	lastMod := getLatestMod()
+	tmpDir := filepath.Join(root, "tmp")
+	_ = os.MkdirAll(tmpDir, 0o755)
+
+	// Clean up older dev_ui_*.so files from previous runs
+	if files, err := os.ReadDir(tmpDir); err == nil {
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), "dev_ui_") && strings.HasSuffix(f.Name(), ".so") {
+				_ = os.Remove(filepath.Join(tmpDir, f.Name()))
+			}
+		}
+	}
+
+	cflagsOut, _ := exec.Command("pkg-config", "--cflags", "--libs", "gtk4").Output()
+	gtk4Flags := strings.Fields(string(cflagsOut))
+
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			currMod := getLatestMod()
+			if currMod.After(lastMod) {
+				time.Sleep(80 * time.Millisecond)
+				lastMod = getLatestMod()
+
+				soPath := filepath.Join(tmpDir, fmt.Sprintf("dev_ui_%d.so", time.Now().UnixNano()))
+				args := []string{"-shared", "-fPIC", "-Wl,--unresolved-symbols=ignore-all", "-o", soPath, targetPath}
+				args = append(args, gtk4Flags...)
+
+				cmd := exec.Command("gcc", args...)
+				output, compileErr := cmd.CombinedOutput()
+				if compileErr != nil {
+					errStr := fmt.Sprintf("UI Compile Error:\n%s", string(output))
+					fmt.Fprintf(os.Stderr, "❌ %s\n", errStr)
+					cErr := C.CString(errStr)
+					C.pom_gtk_dev_show_compile_error(cErr)
+					C.free(unsafe.Pointer(cErr))
+				} else {
+					fmt.Printf("⚡ UI reloaded in-place: %s\n", filepath.Base(soPath))
+					cSo := C.CString(soPath)
+					C.pom_gtk_dev_load_module(cSo)
+					C.free(unsafe.Pointer(cSo))
+				}
+			}
+		}
+	}
 }

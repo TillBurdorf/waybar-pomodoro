@@ -6,7 +6,7 @@ tmp_dir = "tmp"
   entrypoint = ["./tmp/waybar-pomodoro", "dev"]
   args_bin = ["dev"]
   include_ext = ["go", "c", "h"]
-  exclude_dir = ["tmp", ".git"]
+  exclude_dir = ["tmp", ".git", "internal/ui"]
   delay = 200
   stop_on_error = true
 

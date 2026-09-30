@@ -7,10 +7,7 @@ set -e
 
 mkdir -p tmp
 
-if command -v air >/dev/null 2>&1; then
-    exec air
-elif [ -x "$HOME/go/bin/air" ]; then
-    exec "$HOME/go/bin/air"
-else
-    exec go run ./cmd/waybar-pomodoro dev
-fi
+# Stop any background air processes that would kill the dev preview window on edit
+pkill -f "air" 2>/dev/null || true
+
+exec go run ./cmd/waybar-pomodoro dev
