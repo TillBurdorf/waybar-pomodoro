@@ -13,38 +13,41 @@ import (
 	"syscall"
 	"time"
 
+	"waybar-pomodoro/internal/config"
 	"waybar-pomodoro/internal/ipc"
 	"waybar-pomodoro/internal/stats"
 	"waybar-pomodoro/internal/waybar"
 )
 
-const (
-	WorkDuration  = 25 * 60 // 25 minutes
-	BreakDuration = 5 * 60  // 5 minutes
-)
-
 type Timer struct {
-	mu          sync.Mutex
-	mode        string // "work" or "break"
-	remaining   int    // seconds
-	running     bool
-	subscribers map[net.Conn]struct{}
+	mu            sync.Mutex
+	mode          string // "work" or "break"
+	remaining     int    // seconds
+	workDuration  int    // seconds
+	breakDuration int    // seconds
+	running       bool
+	subscribers   map[net.Conn]struct{}
 }
 
 func New() *Timer {
+	cfg := config.Load()
+	w := cfg.WorkDurationMinutes * 60
+	b := cfg.BreakDurationMinutes * 60
 	return &Timer{
-		mode:        "work",
-		remaining:   WorkDuration,
-		running:     false,
-		subscribers: make(map[net.Conn]struct{}),
+		mode:          "work",
+		remaining:     w,
+		workDuration:  w,
+		breakDuration: b,
+		running:       false,
+		subscribers:   make(map[net.Conn]struct{}),
 	}
 }
 
 func (t *Timer) totalLocked() int {
 	if t.mode == "break" {
-		return BreakDuration
+		return t.breakDuration
 	}
-	return WorkDuration
+	return t.workDuration
 }
 
 func (t *Timer) broadcastLocked() {
@@ -66,16 +69,17 @@ func (t *Timer) Tick() {
 		t.remaining--
 		if t.remaining <= 0 {
 			if t.mode == "work" {
-				_ = stats.LogSession("work", WorkDuration)
+				_ = stats.LogSession("work", t.workDuration)
 				t.mode = "break"
-				t.remaining = BreakDuration
-				go sendNotification("Pomodoro Complete! 🍅", "Great focus! Take a 5-minute break.")
+				t.remaining = t.breakDuration
+				t.running = true
+				go sendNotification("Pomodoro Complete! 🍅", fmt.Sprintf("Great focus! Starting %d-minute break.", t.breakDuration/60))
 			} else {
 				t.mode = "work"
-				t.remaining = WorkDuration
+				t.remaining = t.workDuration
+				t.running = false
 				go sendNotification("Break Ended! ☕", "Ready to focus again? Let's start!")
 			}
-			t.running = false
 		}
 		t.broadcastLocked()
 	}
@@ -89,8 +93,8 @@ func (t *Timer) handleConnection(conn net.Conn) {
 	}
 
 	cmd := strings.TrimSpace(scanner.Text())
-	switch cmd {
-	case "subscribe":
+	switch {
+	case cmd == "subscribe":
 		t.mu.Lock()
 		t.subscribers[conn] = struct{}{}
 		out := waybar.Format(t.mode, t.remaining, t.totalLocked(), t.running)
@@ -109,7 +113,7 @@ func (t *Timer) handleConnection(conn net.Conn) {
 		t.mu.Unlock()
 		conn.Close()
 
-	case "toggle":
+	case cmd == "toggle":
 		t.mu.Lock()
 		t.running = !t.running
 		t.broadcastLocked()
@@ -118,24 +122,24 @@ func (t *Timer) handleConnection(conn net.Conn) {
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
-	case "stop":
+	case cmd == "stop":
 		t.mu.Lock()
 		t.running = false
 		t.mode = "work"
-		t.remaining = WorkDuration
+		t.remaining = t.workDuration
 		t.broadcastLocked()
 		t.mu.Unlock()
 
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
-	case "reset":
+	case cmd == "reset":
 		t.mu.Lock()
 		t.running = false
 		if t.mode == "break" {
-			t.remaining = BreakDuration
+			t.remaining = t.breakDuration
 		} else {
-			t.remaining = WorkDuration
+			t.remaining = t.workDuration
 		}
 		t.broadcastLocked()
 		t.mu.Unlock()
@@ -143,15 +147,15 @@ func (t *Timer) handleConnection(conn net.Conn) {
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
-	case "skip":
+	case cmd == "skip":
 		t.mu.Lock()
 		t.running = false
 		if t.mode == "work" {
 			t.mode = "break"
-			t.remaining = BreakDuration
+			t.remaining = t.breakDuration
 		} else {
 			t.mode = "work"
-			t.remaining = WorkDuration
+			t.remaining = t.workDuration
 		}
 		t.broadcastLocked()
 		t.mu.Unlock()
@@ -159,12 +163,32 @@ func (t *Timer) handleConnection(conn net.Conn) {
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
-	case "status":
+	case cmd == "status":
 		t.mu.Lock()
 		out := waybar.Format(t.mode, t.remaining, t.totalLocked(), t.running)
 		t.mu.Unlock()
 
 		_, _ = fmt.Fprintln(conn, out)
+		conn.Close()
+
+	case strings.HasPrefix(cmd, "set_durations "):
+		var w, b int
+		if _, err := fmt.Sscanf(cmd, "set_durations %d %d", &w, &b); err == nil && w > 0 && b > 0 {
+			t.mu.Lock()
+			t.workDuration = w * 60
+			t.breakDuration = b * 60
+			_ = config.Save(config.Config{WorkDurationMinutes: w, BreakDurationMinutes: b})
+			if !t.running {
+				if t.mode == "work" {
+					t.remaining = t.workDuration
+				} else {
+					t.remaining = t.breakDuration
+				}
+			}
+			t.broadcastLocked()
+			t.mu.Unlock()
+		}
+		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
 	default:

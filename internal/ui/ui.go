@@ -22,6 +22,7 @@ import (
 	"time"
 	"unsafe"
 
+	"waybar-pomodoro/internal/config"
 	"waybar-pomodoro/internal/ipc"
 	"waybar-pomodoro/internal/stats"
 	"waybar-pomodoro/internal/waybar"
@@ -31,6 +32,20 @@ import (
 func goGTKCommand(command *C.char) {
 	cmd := C.GoString(command)
 	go func() { _ = ipc.SendCommand(cmd) }()
+}
+
+//export goGTKSetDurations
+func goGTKSetDurations(workMin, breakMin C.int) {
+	w := int(workMin)
+	b := int(breakMin)
+	cfg := config.Config{
+		WorkDurationMinutes:  w,
+		BreakDurationMinutes: b,
+	}
+	_ = config.Save(cfg)
+	go func() {
+		_ = ipc.SendCommand(fmt.Sprintf("set_durations %d %d", w, b))
+	}()
 }
 
 func getUIPidPath() string {
@@ -116,6 +131,9 @@ func RunUI() error {
 		}
 	}()
 
+	cfg := config.Load()
+	C.pom_gtk_set_initial_durations(C.int(cfg.WorkDurationMinutes), C.int(cfg.BreakDurationMinutes))
+
 	status := C.pom_gtk_run()
 	stop()
 	if status != 0 {
@@ -152,9 +170,8 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 		elapsed = total
 	}
 	fraction := float64(elapsed) / float64(total)
-	cycle := summary.TodayCount/4 + 1
 	dots := strings.Repeat("●  ", summary.TodayCount%4) + strings.Repeat("○  ", 4-summary.TodayCount%4)
-	cycleText := fmt.Sprintf("%s Cycle %d", strings.TrimSpace(dots), cycle)
+	cycleText := strings.TrimSpace(dots)
 	history := "No sessions yet today"
 	if len(summary.RecentHistory) > 0 {
 		record := summary.RecentHistory[0]

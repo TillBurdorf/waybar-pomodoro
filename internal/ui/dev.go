@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"waybar-pomodoro/internal/stats"
 	"waybar-pomodoro/internal/waybar"
@@ -167,7 +168,11 @@ func RunDevUI() error {
 
 	status := C.pom_gtk_dev_run()
 	if status != 0 {
-		return fmt.Errorf("GTK dev application exited with status %d", int(status))
+		errMsg := fmt.Sprintf("GTK dev application exited with status %d", int(status))
+		cMsg := C.CString(errMsg)
+		defer C.free(unsafe.Pointer(cMsg))
+		C.pom_gtk_dev_show_fallback_error(cMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 	return nil
 }
