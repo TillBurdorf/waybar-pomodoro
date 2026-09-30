@@ -20,3 +20,9 @@ When verifying code changes, use standard build and test commands:
 - **Check compilation**: `go build ./cmd/waybar-pomodoro`
 - **Run tests**: `go test ./...`
 - **Build / install binary**: `make build` or `make install`
+
+---
+
+## Guardrails
+
+- **Do NOT run the dev view (`waybar-pomodoro dev` / `RunDevUI`)**: The user already has the dev preview running when launching the agent. Agents should only verify changes via build checks and tests.

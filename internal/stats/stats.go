@@ -15,12 +15,43 @@ type SessionRecord struct {
 	Duration  int       `json:"duration_seconds"`
 }
 
+type WorkBlock struct {
+	StartTime string // "10:00"
+	EndTime   string // "10:30"
+	Duration  int    // minutes
+}
+
+type DayStats struct {
+	DayName string // "Mon"
+	DateStr string // "28 Sep"
+	Minutes int    // total minutes
+	TimeStr string // "2h 30m"
+	IsToday bool
+}
+
 type StatsSummary struct {
 	TodayCount    int
 	TodayMinutes  int
 	TotalCount    int
 	TotalMinutes  int
 	RecentHistory []SessionRecord
+	TodayBlocks   []WorkBlock
+	WeekDays      []DayStats
+	WeekTotalMin  int
+}
+
+func FormatDuration(minutes int) string {
+	if minutes <= 0 {
+		return "0m"
+	}
+	h := minutes / 60
+	m := minutes % 60
+	if h > 0 && m > 0 {
+		return fmt.Sprintf("%dh %02dm", h, m)
+	} else if h > 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
 func getStatsFilePath() (string, error) {
@@ -95,6 +126,51 @@ func GetStats() (StatsSummary, error) {
 	// Last 5 sessions (newest first)
 	for i := len(allRecords) - 1; i >= 0 && len(summary.RecentHistory) < 5; i-- {
 		summary.RecentHistory = append(summary.RecentHistory, allRecords[i])
+	}
+
+	// Today's workblocks in chronological order
+	for _, rec := range allRecords {
+		if rec.Mode == "work" && rec.Timestamp.Local().Format("2006-01-02") == today {
+			mins := rec.Duration / 60
+			if mins <= 0 {
+				mins = 1
+			}
+			endTime := rec.Timestamp.Local()
+			startTime := endTime.Add(-time.Duration(rec.Duration) * time.Second)
+			summary.TodayBlocks = append(summary.TodayBlocks, WorkBlock{
+				StartTime: startTime.Format("15:04"),
+				EndTime:   endTime.Format("15:04"),
+				Duration:  mins,
+			})
+		}
+	}
+
+	// Weekly statistics (Monday through Sunday of current week)
+	now := time.Now().Local()
+	weekday := int(now.Weekday())
+	offsetFromMonday := (weekday + 6) % 7
+	monday := now.AddDate(0, 0, -offsetFromMonday)
+
+	dayMinutes := make(map[string]int)
+	for _, rec := range allRecords {
+		if rec.Mode == "work" {
+			dayKey := rec.Timestamp.Local().Format("2006-01-02")
+			dayMinutes[dayKey] += rec.Duration / 60
+		}
+	}
+
+	for i := 0; i < 7; i++ {
+		d := monday.AddDate(0, 0, i)
+		dKey := d.Format("2006-01-02")
+		mins := dayMinutes[dKey]
+		summary.WeekTotalMin += mins
+		summary.WeekDays = append(summary.WeekDays, DayStats{
+			DayName: d.Format("Mon"),
+			DateStr: d.Format("02 Jan"),
+			Minutes: mins,
+			TimeStr: FormatDuration(mins),
+			IsToday: dKey == today,
+		})
 	}
 
 	return summary, nil

@@ -11,9 +11,17 @@ static GtkLabel *mode_label;
 static GtkLabel *timer_label;
 static GtkLabel *status_label;
 static GtkLabel *cycle_label;
-static GtkLabel *stats_label;
-static GtkLabel *history_label;
-static GtkWidget *progress_ring;
+static GtkWidget *progress_ring = NULL;
+static GtkWidget *main_stack = NULL;
+static GtkWidget *stats_sub_stack = NULL;
+static GtkWidget *stats_today_summary_lbl = NULL;
+static GtkWidget *stats_today_box = NULL;
+static GtkWidget *stats_week_summary_lbl = NULL;
+static GtkWidget *stats_week_box = NULL;
+static GtkWidget *timer_buttons[4] = {NULL, NULL, NULL, NULL};
+static const char *timer_button_commands[4] = {"toggle", "skip", "reset", "stop"};
+static int focused_timer_button_idx = 0;
+static GtkWidget *setting_entries[2] = {NULL, NULL};
 static double current_progress_fraction = 0.0;
 static int current_is_break = 0;
 static int is_dev_mode = 0;
@@ -154,8 +162,6 @@ static gboolean apply_update(gpointer data) {
     set_label(timer_label, update->timer);
     set_label(status_label, update->status);
     set_label(cycle_label, update->cycle);
-    set_label(stats_label, update->stats);
-    set_label(history_label, update->history);
     current_progress_fraction = update->fraction;
     current_is_break = (update->mode != NULL && strcmp(update->mode, "BREAK") == 0);
     if (progress_ring != NULL) {
@@ -193,6 +199,176 @@ void pom_gtk_update(const char *mode, const char *timer, const char *status,
     g_idle_add(apply_update, update);
 }
 
+typedef struct {
+    char *today_summary;
+    char *today_blocks;
+    char *week_summary;
+    char *week_days;
+} StatsUpdate;
+
+static gboolean apply_stats_update(gpointer data) {
+    StatsUpdate *up = (StatsUpdate *)data;
+    if (stats_today_summary_lbl != NULL && up->today_summary != NULL) {
+        gtk_label_set_text(GTK_LABEL(stats_today_summary_lbl), up->today_summary);
+    }
+    if (stats_week_summary_lbl != NULL && up->week_summary != NULL) {
+        gtk_label_set_text(GTK_LABEL(stats_week_summary_lbl), up->week_summary);
+    }
+
+    // Populate Today's blocks
+    if (stats_today_box != NULL) {
+        GtkWidget *c = gtk_widget_get_first_child(stats_today_box);
+        while (c != NULL) {
+            GtkWidget *next = gtk_widget_get_next_sibling(c);
+            gtk_box_remove(GTK_BOX(stats_today_box), c);
+            c = next;
+        }
+
+        if (up->today_blocks == NULL || strlen(up->today_blocks) == 0) {
+            GtkWidget *empty_lbl = gtk_label_new("No work blocks recorded yet today");
+            gtk_widget_add_css_class(empty_lbl, "muted-label");
+            gtk_widget_set_margin_top(empty_lbl, 24);
+            gtk_box_append(GTK_BOX(stats_today_box), empty_lbl);
+        } else {
+            char **lines = g_strsplit(up->today_blocks, "\n", -1);
+            for (int i = 0; lines[i] != NULL; i++) {
+                if (strlen(lines[i]) == 0) continue;
+                char **parts = g_strsplit(lines[i], "|", 3);
+                if (parts[0] != NULL && parts[1] != NULL) {
+                    const char *start = parts[0];
+                    const char *end = parts[1];
+                    const char *dur = parts[2] ? parts[2] : "30m";
+
+                    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                    gtk_widget_add_css_class(row, "timeline-row");
+
+                    GtkWidget *time_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+                    gtk_widget_set_size_request(time_box, 48, -1);
+                    gtk_widget_set_valign(time_box, GTK_ALIGN_CENTER);
+
+                    GtkWidget *s_lbl = gtk_label_new(start);
+                    gtk_widget_add_css_class(s_lbl, "timeline-time");
+                    gtk_label_set_xalign(GTK_LABEL(s_lbl), 1.0f);
+
+                    GtkWidget *e_lbl = gtk_label_new(end);
+                    gtk_widget_add_css_class(e_lbl, "timeline-time-end");
+                    gtk_label_set_xalign(GTK_LABEL(e_lbl), 1.0f);
+
+                    gtk_box_append(GTK_BOX(time_box), s_lbl);
+                    gtk_box_append(GTK_BOX(time_box), e_lbl);
+
+                    GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+                    gtk_widget_add_css_class(card, "timeline-card");
+                    gtk_widget_set_hexpand(card, TRUE);
+
+                    GtkWidget *title = gtk_label_new("Focus Block");
+                    gtk_widget_add_css_class(title, "timeline-title");
+                    gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
+
+                    char sub_buf[64];
+                    snprintf(sub_buf, sizeof(sub_buf), "%s  •  %s - %s", dur, start, end);
+                    GtkWidget *sub = gtk_label_new(sub_buf);
+                    gtk_widget_add_css_class(sub, "timeline-subtitle");
+                    gtk_label_set_xalign(GTK_LABEL(sub), 0.0f);
+
+                    gtk_box_append(GTK_BOX(card), title);
+                    gtk_box_append(GTK_BOX(card), sub);
+
+                    gtk_box_append(GTK_BOX(row), time_box);
+                    gtk_box_append(GTK_BOX(row), card);
+                    gtk_box_append(GTK_BOX(stats_today_box), row);
+                }
+                g_strfreev(parts);
+            }
+            g_strfreev(lines);
+        }
+    }
+
+    // Populate Weekly days
+    if (stats_week_box != NULL) {
+        GtkWidget *c = gtk_widget_get_first_child(stats_week_box);
+        while (c != NULL) {
+            GtkWidget *next = gtk_widget_get_next_sibling(c);
+            gtk_box_remove(GTK_BOX(stats_week_box), c);
+            c = next;
+        }
+
+        if (up->week_days != NULL && strlen(up->week_days) > 0) {
+            char **lines = g_strsplit(up->week_days, "\n", -1);
+            int max_min = 60;
+            for (int i = 0; lines[i] != NULL; i++) {
+                if (strlen(lines[i]) == 0) continue;
+                char **parts = g_strsplit(lines[i], "|", 5);
+                if (parts[0] && parts[1] && parts[2]) {
+                    int m = atoi(parts[2]);
+                    if (m > max_min) max_min = m;
+                }
+                g_strfreev(parts);
+            }
+
+            for (int i = 0; lines[i] != NULL; i++) {
+                if (strlen(lines[i]) == 0) continue;
+                char **parts = g_strsplit(lines[i], "|", 5);
+                if (parts[0] && parts[1] && parts[2] && parts[3]) {
+                    const char *day = parts[0];
+                    int m = atoi(parts[2]);
+                    const char *timestr = parts[3];
+                    int is_today = parts[4] ? atoi(parts[4]) : 0;
+
+                    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                    gtk_widget_add_css_class(row, "week-row");
+                    if (is_today) {
+                        gtk_widget_add_css_class(row, "is-today");
+                    }
+
+                    GtkWidget *d_lbl = gtk_label_new(day);
+                    gtk_widget_add_css_class(d_lbl, is_today ? "week-day-today" : "week-day");
+                    gtk_widget_set_size_request(d_lbl, 32, -1);
+                    gtk_label_set_xalign(GTK_LABEL(d_lbl), 0.0f);
+
+                    GtkWidget *pb = gtk_progress_bar_new();
+                    gtk_widget_add_css_class(pb, is_today ? "week-bar-today" : "week-bar");
+                    gtk_widget_set_hexpand(pb, TRUE);
+                    gtk_widget_set_valign(pb, GTK_ALIGN_CENTER);
+                    double frac = (double)m / (double)max_min;
+                    if (frac < 0.0) frac = 0.0;
+                    if (frac > 1.0) frac = 1.0;
+                    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pb), frac);
+
+                    GtkWidget *t_lbl = gtk_label_new(timestr);
+                    gtk_widget_add_css_class(t_lbl, is_today ? "week-time-today" : "week-time");
+                    gtk_widget_set_size_request(t_lbl, 55, -1);
+                    gtk_label_set_xalign(GTK_LABEL(t_lbl), 1.0f);
+
+                    gtk_box_append(GTK_BOX(row), d_lbl);
+                    gtk_box_append(GTK_BOX(row), pb);
+                    gtk_box_append(GTK_BOX(row), t_lbl);
+                    gtk_box_append(GTK_BOX(stats_week_box), row);
+                }
+                g_strfreev(parts);
+            }
+            g_strfreev(lines);
+        }
+    }
+
+    g_free(up->today_summary);
+    g_free(up->today_blocks);
+    g_free(up->week_summary);
+    g_free(up->week_days);
+    g_free(up);
+    return G_SOURCE_REMOVE;
+}
+
+void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_data,
+                          const char *week_summary, const char *week_days_data) {
+    StatsUpdate *up = g_new0(StatsUpdate, 1);
+    up->today_summary = g_strdup(today_summary);
+    up->today_blocks = g_strdup(today_blocks_data);
+    up->week_summary = g_strdup(week_summary);
+    up->week_days = g_strdup(week_days_data);
+    g_idle_add(apply_stats_update, up);
+}
+
 static GtkWidget *make_label(const char *text, const char *css_class) {
     GtkWidget *label = gtk_label_new(text);
     gtk_widget_add_css_class(label, css_class);
@@ -200,8 +376,45 @@ static GtkWidget *make_label(const char *text, const char *css_class) {
     return label;
 }
 
+static void update_timer_button_focus(int new_idx) {
+    if (new_idx < 0) new_idx = 3;
+    if (new_idx > 3) new_idx = 0;
+    focused_timer_button_idx = new_idx;
+    for (int i = 0; i < 4; i++) {
+        if (timer_buttons[i] != NULL) {
+            GtkWidget *child = gtk_button_get_child(GTK_BUTTON(timer_buttons[i]));
+            if (i == focused_timer_button_idx) {
+                gtk_widget_add_css_class(timer_buttons[i], "focused");
+                if (child != NULL && GTK_IS_IMAGE(child)) {
+                    gtk_image_set_pixel_size(GTK_IMAGE(child), 22);
+                }
+            } else {
+                gtk_widget_remove_css_class(timer_buttons[i], "focused");
+                if (child != NULL && GTK_IS_IMAGE(child)) {
+                    gtk_image_set_pixel_size(GTK_IMAGE(child), 16);
+                }
+            }
+        }
+    }
+}
+
+static void trigger_focused_timer_button(void) {
+    if (focused_timer_button_idx < 0 || focused_timer_button_idx >= 4) return;
+    const char *cmd = timer_button_commands[focused_timer_button_idx];
+    if (is_dev_mode) {
+        goGTKDevAction((char *)cmd);
+    } else {
+        goGTKCommand((char *)cmd);
+    }
+}
+
 static void button_clicked(GtkButton *button, gpointer command) {
-    (void)button;
+    for (int i = 0; i < 4; i++) {
+        if (timer_buttons[i] == GTK_WIDGET(button)) {
+            update_timer_button_focus(i);
+            break;
+        }
+    }
     if (is_dev_mode) {
         goGTKDevAction((char *)command);
     } else {
@@ -211,6 +424,10 @@ static void button_clicked(GtkButton *button, gpointer command) {
 
 static GtkWidget *make_button(const char *icon, const char *command, const char *css_class) {
     GtkWidget *button = gtk_button_new_from_icon_name(icon);
+    GtkWidget *child = gtk_button_get_child(GTK_BUTTON(button));
+    if (child != NULL && GTK_IS_IMAGE(child)) {
+        gtk_image_set_pixel_size(GTK_IMAGE(child), 16);
+    }
     gtk_widget_add_css_class(button, css_class);
     gtk_widget_set_tooltip_text(button, command);
     gtk_widget_set_size_request(button, 40, 40);
@@ -257,10 +474,14 @@ static GtkWidget *build_timer_page(void) {
     gtk_widget_set_halign(buttons, GTK_ALIGN_CENTER);
     gtk_widget_set_vexpand(buttons, TRUE);
     gtk_widget_set_valign(buttons, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(buttons), make_button("media-playback-start-symbolic", "toggle", "ctrl-btn"));
-    gtk_box_append(GTK_BOX(buttons), make_button("media-skip-forward-symbolic", "skip", "ctrl-btn"));
-    gtk_box_append(GTK_BOX(buttons), make_button("view-refresh-symbolic", "reset", "ctrl-btn"));
-    gtk_box_append(GTK_BOX(buttons), make_button("media-playback-stop-symbolic", "stop", "ctrl-btn"));
+    timer_buttons[0] = make_button("media-playback-start-symbolic", "toggle", "ctrl-btn");
+    timer_buttons[1] = make_button("media-skip-forward-symbolic", "skip", "ctrl-btn");
+    timer_buttons[2] = make_button("view-refresh-symbolic", "reset", "ctrl-btn");
+    timer_buttons[3] = make_button("media-playback-stop-symbolic", "stop", "ctrl-btn");
+    for (int i = 0; i < 4; i++) {
+        gtk_box_append(GTK_BOX(buttons), timer_buttons[i]);
+    }
+    update_timer_button_focus(0);
 
     gtk_box_append(GTK_BOX(box), overlay);
     gtk_box_append(GTK_BOX(box), GTK_WIDGET(cycle_label));
@@ -269,23 +490,89 @@ static GtkWidget *build_timer_page(void) {
     return box;
 }
 
-/* Builds Tab 2: Statistics Page */
-static GtkWidget *build_stats_page(void) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+static GtkWidget *build_stats_today_page(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_vexpand(box, TRUE);
     gtk_widget_set_hexpand(box, TRUE);
-    gtk_widget_set_valign(box, GTK_ALIGN_START);
-    gtk_widget_set_margin_top(box, 16);
 
-    GtkWidget *title = make_label("Daily Overview", "stats-title");
-    gtk_box_append(GTK_BOX(box), title);
+    stats_today_summary_lbl = make_label("0 sessions · 0m focus", "stats-sub-header");
+    gtk_widget_set_halign(stats_today_summary_lbl, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(box), stats_today_summary_lbl);
 
-    stats_label = GTK_LABEL(make_label("0 sessions · 0 min focus", "stats-label"));
-    history_label = GTK_LABEL(make_label("No sessions yet today", "muted-label"));
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_widget_set_hexpand(scroll, TRUE);
+    gtk_widget_set_size_request(scroll, -1, 210);
 
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(stats_label));
-    gtk_box_append(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(history_label));
+    stats_today_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_vexpand(stats_today_box, TRUE);
+    gtk_widget_set_hexpand(stats_today_box, TRUE);
+    gtk_widget_add_css_class(stats_today_box, "timeline-box");
+
+    GtkWidget *empty_lbl = gtk_label_new("No work blocks recorded yet today");
+    gtk_widget_add_css_class(empty_lbl, "muted-label");
+    gtk_widget_set_margin_top(empty_lbl, 24);
+    gtk_box_append(GTK_BOX(stats_today_box), empty_lbl);
+
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), stats_today_box);
+    gtk_box_append(GTK_BOX(box), scroll);
+
+    return box;
+}
+
+static GtkWidget *build_stats_week_page(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_vexpand(box, TRUE);
+    gtk_widget_set_hexpand(box, TRUE);
+
+    stats_week_summary_lbl = make_label("This Week: 0m total", "stats-sub-header");
+    gtk_widget_set_halign(stats_week_summary_lbl, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(box), stats_week_summary_lbl);
+
+    stats_week_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_vexpand(stats_week_box, TRUE);
+    gtk_widget_set_hexpand(stats_week_box, TRUE);
+    gtk_widget_set_margin_top(stats_week_box, 4);
+
+    gtk_box_append(GTK_BOX(box), stats_week_box);
+
+    return box;
+}
+
+/* Builds Tab 2: Statistics Page with Today and Weekly sub-tabs */
+static GtkWidget *build_stats_page(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_vexpand(box, TRUE);
+    gtk_widget_set_hexpand(box, TRUE);
+    gtk_widget_set_valign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_margin_top(box, 4);
+
+    stats_sub_stack = gtk_stack_new();
+    gtk_stack_set_transition_type(GTK_STACK(stats_sub_stack), GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+    gtk_widget_set_vexpand(stats_sub_stack, TRUE);
+    gtk_widget_set_hexpand(stats_sub_stack, TRUE);
+
+    GtkWidget *today_page = build_stats_today_page();
+    GtkWidget *week_page = build_stats_week_page();
+
+    GtkStackPage *p_today = gtk_stack_add_child(GTK_STACK(stats_sub_stack), today_page);
+    gtk_stack_page_set_name(p_today, "today");
+    gtk_stack_page_set_title(p_today, "Today");
+
+    GtkStackPage *p_week = gtk_stack_add_child(GTK_STACK(stats_sub_stack), week_page);
+    gtk_stack_page_set_name(p_week, "week");
+    gtk_stack_page_set_title(p_week, "Weekly");
+
+    GtkWidget *sub_switcher = gtk_stack_switcher_new();
+    gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(sub_switcher), GTK_STACK(stats_sub_stack));
+    gtk_widget_set_halign(sub_switcher, GTK_ALIGN_CENTER);
+    gtk_widget_add_css_class(sub_switcher, "stats-sub-switcher");
+    gtk_widget_set_margin_top(sub_switcher, 4);
+    gtk_widget_set_margin_bottom(sub_switcher, 2);
+
+    gtk_box_append(GTK_BOX(box), stats_sub_stack);
+    gtk_box_append(GTK_BOX(box), sub_switcher);
 
     return box;
 }
@@ -372,6 +659,9 @@ static GtkWidget *build_duration_setting_block(const char *title, int initial_va
     gtk_widget_set_valign(input_box, GTK_ALIGN_CENTER);
 
     GtkWidget *entry = gtk_entry_new();
+    if (setting_type >= 0 && setting_type < 2) {
+        setting_entries[setting_type] = entry;
+    }
     gtk_widget_add_css_class(entry, "setting-entry");
     gtk_entry_set_max_length(GTK_ENTRY(entry), 3);
     gtk_editable_set_width_chars(GTK_EDITABLE(entry), 3);
@@ -407,6 +697,42 @@ static GtkWidget *build_duration_setting_block(const char *title, int initial_va
     return block;
 }
 
+static void focus_setting_entry(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx > 1) idx = 1;
+    if (setting_entries[idx] != NULL) {
+        gtk_widget_grab_focus(setting_entries[idx]);
+        gtk_editable_select_region(GTK_EDITABLE(setting_entries[idx]), 0, -1);
+    }
+}
+
+static void switch_setting_entry(int direction) {
+    GtkRoot *root = main_stack ? gtk_widget_get_root(main_stack) : NULL;
+    GtkWidget *focus = (root && GTK_IS_WINDOW(root)) ? gtk_window_get_focus(GTK_WINDOW(root)) : NULL;
+
+    int current_idx = -1;
+    for (int i = 0; i < 2; i++) {
+        if (setting_entries[i] != NULL) {
+            if (focus == setting_entries[i] || gtk_widget_is_ancestor(focus, setting_entries[i])) {
+                current_idx = i;
+                break;
+            }
+        }
+    }
+
+    int next_idx;
+    if (current_idx == -1) {
+        next_idx = (direction > 0) ? 1 : 0;
+    } else {
+        if (direction > 0) {
+            next_idx = (current_idx + 1) % 2;
+        } else {
+            next_idx = (current_idx - 1 + 2) % 2;
+        }
+    }
+    focus_setting_entry(next_idx);
+}
+
 /* Builds Tab 3: Settings Page */
 static GtkWidget *build_settings_page(void) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
@@ -427,6 +753,32 @@ static GtkWidget *build_settings_page(void) {
     gtk_box_append(GTK_BOX(box), break_block);
 
     return box;
+}
+
+static gboolean focus_first_entry_idle(gpointer user_data) {
+    (void)user_data;
+    if (main_stack != NULL) {
+        const char *name = gtk_stack_get_visible_child_name(GTK_STACK(main_stack));
+        if (name != NULL && strcmp(name, "settings") == 0) {
+            focus_setting_entry(0);
+        }
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void on_stack_visible_child_changed(GObject *gobject, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    (void)user_data;
+    const char *name = gtk_stack_get_visible_child_name(GTK_STACK(gobject));
+    if (name != NULL && strcmp(name, "settings") == 0) {
+        focus_setting_entry(0);
+        g_idle_add(focus_first_entry_idle, NULL);
+    } else {
+        GtkRoot *root = gtk_widget_get_root(GTK_WIDGET(gobject));
+        if (root != NULL && GTK_IS_WINDOW(root)) {
+            gtk_window_set_focus(GTK_WINDOW(root), NULL);
+        }
+    }
 }
 
 /* Tabbed Popup Container */
@@ -451,7 +803,7 @@ static GtkWidget *build_pomodoro_card(void) {
 
     GtkStackPage *page_stats = gtk_stack_add_child(GTK_STACK(stack), stats_page);
     gtk_stack_page_set_name(page_stats, "stats");
-    gtk_stack_page_set_icon_name(page_stats, "view-list-symbolic");
+    gtk_stack_page_set_icon_name(page_stats, "network-cellular-signal-excellent-symbolic");
 
     GtkStackPage *page_settings = gtk_stack_add_child(GTK_STACK(stack), settings_page);
     gtk_stack_page_set_name(page_settings, "settings");
@@ -477,24 +829,136 @@ static GtkWidget *build_pomodoro_card(void) {
         gtk_widget_set_tooltip_text(tab_btn, "Settings");
     }
 
+    main_stack = stack;
+    g_signal_connect(stack, "notify::visible-child-name", G_CALLBACK(on_stack_visible_child_changed), NULL);
+
     gtk_box_append(GTK_BOX(box), switcher);
     gtk_box_append(GTK_BOX(box), stack);
 
     return box;
 }
+
+static void switch_tab(int forward) {
+    if (main_stack == NULL) return;
+    const char *current = gtk_stack_get_visible_child_name(GTK_STACK(main_stack));
+    static const char *tabs[] = {"timer", "stats", "settings"};
+    int count = sizeof(tabs) / sizeof(tabs[0]);
+    int idx = 0;
+    if (current != NULL) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(tabs[i], current) == 0) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (forward) {
+        idx = (idx + 1) % count;
+    } else {
+        idx = (idx - 1 + count) % count;
+    }
+    gtk_stack_set_visible_child_name(GTK_STACK(main_stack), tabs[idx]);
+
+    if (strcmp(tabs[idx], "settings") == 0) {
+        focus_setting_entry(0);
+        g_idle_add(focus_first_entry_idle, NULL);
+    } else {
+        GtkRoot *root = gtk_widget_get_root(main_stack);
+        if (root != NULL && GTK_IS_WINDOW(root)) {
+            gtk_window_set_focus(GTK_WINDOW(root), NULL);
+        }
+    }
+}
+
+static void cycle_stats_sub_tab(int forward) {
+    if (stats_sub_stack == NULL) return;
+    const char *current = gtk_stack_get_visible_child_name(GTK_STACK(stats_sub_stack));
+    static const char *sub_tabs[] = {"today", "week"};
+    int count = sizeof(sub_tabs) / sizeof(sub_tabs[0]);
+    int idx = 0;
+    if (current != NULL) {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(sub_tabs[i], current) == 0) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (forward) {
+        idx = (idx + 1) % count;
+    } else {
+        idx = (idx - 1 + count) % count;
+    }
+    gtk_stack_set_visible_child_name(GTK_STACK(stats_sub_stack), sub_tabs[idx]);
+}
+
 static gboolean key_pressed(GtkEventControllerKey *controller, guint keyval,
                             guint keycode, GdkModifierType state, gpointer data) {
-    (void)controller;
     (void)keycode;
-    (void)state;
     (void)data;
-    switch (keyval) {
-    case GDK_KEY_space: goGTKCommand("toggle"); return TRUE;
-    case GDK_KEY_Escape:
-    case GDK_KEY_q:
-    case GDK_KEY_Q:
+    if (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) {
+        gboolean backward = (keyval == GDK_KEY_ISO_Left_Tab) || ((state & GDK_SHIFT_MASK) != 0);
+        switch_tab(!backward);
+        return TRUE;
+    }
+
+    const char *current_tab = main_stack ? gtk_stack_get_visible_child_name(GTK_STACK(main_stack)) : NULL;
+
+    // Handle vim navigation in Stats view: h/Left or l/Right cycles between Today and Weekly
+    if (current_tab != NULL && strcmp(current_tab, "stats") == 0) {
+        if (keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Left) {
+            cycle_stats_sub_tab(0);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_Right) {
+            cycle_stats_sub_tab(1);
+            return TRUE;
+        }
+    }
+
+    // Handle vim navigation in Settings view: k/h to focus work duration, l/j to focus break duration
+    if (current_tab != NULL && strcmp(current_tab, "settings") == 0) {
+        if (keyval == GDK_KEY_k || keyval == GDK_KEY_K || keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Up) {
+            switch_setting_entry(-1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_j || keyval == GDK_KEY_J || keyval == GDK_KEY_Down) {
+            switch_setting_entry(1);
+            return TRUE;
+        }
+    }
+
+    // Handle vim navigation and enter trigger in Timer view: h/l to cycle buttons, Enter to activate
+    if (current_tab != NULL && strcmp(current_tab, "timer") == 0) {
+        if (keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Left) {
+            update_timer_button_focus(focused_timer_button_idx - 1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_Right) {
+            update_timer_button_focus(focused_timer_button_idx + 1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            trigger_focused_timer_button();
+            return TRUE;
+        }
+    }
+
+    GtkWidget *win = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
+    GtkWidget *focus = GTK_IS_WINDOW(win) ? gtk_window_get_focus(GTK_WINDOW(win)) : NULL;
+    gboolean is_editable = (focus != NULL && (GTK_IS_EDITABLE(focus) || GTK_IS_TEXT(focus)));
+
+    if (keyval == GDK_KEY_Escape || (!is_editable && (keyval == GDK_KEY_q || keyval == GDK_KEY_Q))) {
         pom_gtk_quit_async();
         return TRUE;
+    }
+
+    if (is_editable) {
+        return FALSE;
+    }
+
+    switch (keyval) {
+    case GDK_KEY_space: goGTKCommand("toggle"); return TRUE;
     case GDK_KEY_s: case GDK_KEY_S: goGTKCommand("skip"); return TRUE;
     case GDK_KEY_r: case GDK_KEY_R: goGTKCommand("reset"); return TRUE;
     case GDK_KEY_x: case GDK_KEY_X: goGTKCommand("stop"); return TRUE;
@@ -504,10 +968,69 @@ static gboolean key_pressed(GtkEventControllerKey *controller, guint keyval,
 
 static gboolean key_pressed_dev(GtkEventControllerKey *controller, guint keyval,
                                 guint keycode, GdkModifierType state, gpointer data) {
-    (void)controller;
     (void)keycode;
-    (void)state;
     (void)data;
+    if (keyval == GDK_KEY_Tab || keyval == GDK_KEY_ISO_Left_Tab) {
+        gboolean backward = (keyval == GDK_KEY_ISO_Left_Tab) || ((state & GDK_SHIFT_MASK) != 0);
+        switch_tab(!backward);
+        return TRUE;
+    }
+
+    const char *current_tab = main_stack ? gtk_stack_get_visible_child_name(GTK_STACK(main_stack)) : NULL;
+
+    // Handle vim navigation in Stats view: h/Left or l/Right cycles between Today and Weekly
+    if (current_tab != NULL && strcmp(current_tab, "stats") == 0) {
+        if (keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Left) {
+            cycle_stats_sub_tab(0);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_Right) {
+            cycle_stats_sub_tab(1);
+            return TRUE;
+        }
+    }
+
+    // Handle vim navigation in Settings view: k/h to focus work duration, l/j to focus break duration
+    if (current_tab != NULL && strcmp(current_tab, "settings") == 0) {
+        if (keyval == GDK_KEY_k || keyval == GDK_KEY_K || keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Up) {
+            switch_setting_entry(-1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_j || keyval == GDK_KEY_J || keyval == GDK_KEY_Down) {
+            switch_setting_entry(1);
+            return TRUE;
+        }
+    }
+
+    // Handle vim navigation and enter trigger in Timer view: h/l to cycle buttons, Enter to activate
+    if (current_tab != NULL && strcmp(current_tab, "timer") == 0) {
+        if (keyval == GDK_KEY_h || keyval == GDK_KEY_H || keyval == GDK_KEY_Left) {
+            update_timer_button_focus(focused_timer_button_idx - 1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_l || keyval == GDK_KEY_L || keyval == GDK_KEY_Right) {
+            update_timer_button_focus(focused_timer_button_idx + 1);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            trigger_focused_timer_button();
+            return TRUE;
+        }
+    }
+
+    GtkWidget *win = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
+    GtkWidget *focus = GTK_IS_WINDOW(win) ? gtk_window_get_focus(GTK_WINDOW(win)) : NULL;
+    gboolean is_editable = (focus != NULL && (GTK_IS_EDITABLE(focus) || GTK_IS_TEXT(focus)));
+
+    if (keyval == GDK_KEY_Escape || (!is_editable && (keyval == GDK_KEY_q || keyval == GDK_KEY_Q))) {
+        pom_gtk_quit_async();
+        return TRUE;
+    }
+
+    if (is_editable) {
+        return FALSE;
+    }
+
     switch (keyval) {
     case GDK_KEY_space: goGTKDevAction("toggle"); return TRUE;
     case GDK_KEY_m: case GDK_KEY_M: goGTKDevAction("mode"); return TRUE;
@@ -518,17 +1041,18 @@ static gboolean key_pressed_dev(GtkEventControllerKey *controller, guint keyval,
     case GDK_KEY_s: case GDK_KEY_S: goGTKDevAction("skip"); return TRUE;
     case GDK_KEY_r: case GDK_KEY_R: goGTKDevAction("reset"); return TRUE;
     case GDK_KEY_x: case GDK_KEY_X: goGTKDevAction("stop"); return TRUE;
-    case GDK_KEY_Escape:
-    case GDK_KEY_q:
-    case GDK_KEY_Q:
-        pom_gtk_quit_async();
-        return TRUE;
     default: return FALSE;
     }
 }
 
 static void activate(GtkApplication *app, gpointer data) {
     (void)data;
+    GList *windows = gtk_application_get_windows(app);
+    if (windows != NULL) {
+        gtk_window_present(GTK_WINDOW(windows->data));
+        return;
+    }
+
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Pomodoro");
     gtk_window_set_default_size(GTK_WINDOW(window), 320, 380);
@@ -540,6 +1064,7 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_window_set_child(GTK_WINDOW(window), build_pomodoro_card());
 
     GtkEventController *keys = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(key_pressed), NULL);
     gtk_widget_add_controller(window, keys);
     gtk_window_present(GTK_WINDOW(window));
@@ -547,6 +1072,12 @@ static void activate(GtkApplication *app, gpointer data) {
 
 static void activate_dev(GtkApplication *app, gpointer data) {
     (void)data;
+    GList *windows = gtk_application_get_windows(app);
+    if (windows != NULL) {
+        gtk_window_present(GTK_WINDOW(windows->data));
+        return;
+    }
+
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Pomodoro [DEV PREVIEW]");
     gtk_window_set_default_size(GTK_WINDOW(window), 540, 520);
@@ -598,12 +1129,13 @@ static void activate_dev(GtkApplication *app, gpointer data) {
     gtk_box_append(GTK_BOX(center_box), card_frame);
     gtk_box_append(GTK_BOX(main_box), center_box);
 
-    GtkWidget *bottom_banner = make_label("[M] Mode  •  [P] Progress  •  [C] Cycles  •  [+/-] Time  •  [Space] Play/Pause  •  [Q] Quit", "dev-banner");
+    GtkWidget *bottom_banner = make_label("[H/L] Select  •  [Enter] Trigger  •  [K/L] Settings  •  [Tab] Tabs  •  [Space] Play/Pause  •  [Q] Quit", "dev-banner");
     gtk_widget_set_margin_top(bottom_banner, 12);
     gtk_widget_set_margin_bottom(bottom_banner, 16);
     gtk_box_append(GTK_BOX(main_box), bottom_banner);
 
     GtkEventController *keys = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(key_pressed_dev), NULL);
     gtk_widget_add_controller(window, keys);
     gtk_window_present(GTK_WINDOW(window));
@@ -622,12 +1154,36 @@ static void on_startup(GApplication *app, gpointer data) {
         ".mode-label.break-mode { color: #89b4fa; }"
         ".timer-label { font-family: monospace; font-size: 40px; font-weight: bold; color: #cdd6f4; }"
         ".muted-label { color: #9399b2; font-size: 12px; }"
-        ".stats-title { font-size: 14px; font-weight: bold; color: #b4befe; }"
-        ".stats-label { color: #cdd6f4; font-size: 13px; font-weight: bold; }"
+        ".stats-sub-switcher { background: #181825; border-radius: 8px; padding: 2px; }"
+        ".stats-sub-switcher button { border: none; border-radius: 6px; padding: 2px 14px; min-height: 22px; min-width: 56px; background: transparent; color: #a6adc8; font-size: 11px; font-weight: bold; outline: none; box-shadow: none; }"
+        ".stats-sub-switcher button:checked { background: #313244; color: #b4befe; }"
+        ".stats-sub-switcher button:hover { color: #cdd6f4; }"
+        ".stats-sub-header { color: #a6adc8; font-size: 11px; font-weight: bold; margin-bottom: 2px; }"
+        ".timeline-box { padding: 4px 6px; }"
+        ".timeline-row { margin-bottom: 6px; }"
+        ".timeline-time { font-family: monospace; font-size: 11px; font-weight: bold; color: #b4befe; }"
+        ".timeline-time-end { font-family: monospace; font-size: 10px; color: #6c7086; }"
+        ".timeline-card { background: #181825; border-left: 3px solid #b4befe; border-radius: 6px; padding: 5px 8px; }"
+        ".timeline-title { font-size: 11px; font-weight: bold; color: #cdd6f4; }"
+        ".timeline-subtitle { font-size: 10px; color: #a6adc8; }"
+        ".week-row { padding: 3px 6px; border-radius: 6px; min-height: 22px; }"
+        ".week-row.is-today { background: rgba(180, 190, 254, 0.08); }"
+        ".week-day { font-size: 11px; font-weight: bold; color: #a6adc8; }"
+        ".week-day-today { font-size: 11px; font-weight: bold; color: #b4befe; }"
+        ".week-bar trough { background: #313244; min-height: 7px; border-radius: 4px; }"
+        ".week-bar progress { background: #89b4fa; border-radius: 4px; min-height: 7px; }"
+        ".week-bar-today trough { background: #313244; min-height: 7px; border-radius: 4px; }"
+        ".week-bar-today progress { background: #b4befe; border-radius: 4px; min-height: 7px; }"
+        ".week-time { font-family: monospace; font-size: 11px; color: #a6adc8; }"
+        ".week-time-today { font-family: monospace; font-size: 11px; font-weight: bold; color: #b4befe; }"
         "separator { background: #45475a; min-height: 1px; }"
-        "button.ctrl-btn { border: none; border-radius: 20px; min-width: 40px; min-height: 40px; padding: 0; background: transparent; color: #a6adc8; }"
+        "button.ctrl-btn { border: none; border-radius: 20px; min-width: 40px; min-height: 40px; padding: 0; background: transparent; color: #a6adc8; outline: none; box-shadow: none; }"
+        "button.ctrl-btn image { -gtk-icon-size: 16px; }"
         "button.ctrl-btn:hover { background: #313244; color: #cdd6f4; }"
         "button.ctrl-btn:active { background: #45475a; color: #ffffff; }"
+        "button.ctrl-btn.focused { color: #b4befe; background: transparent; border: none; outline: none; box-shadow: none; }"
+        "button.ctrl-btn.focused image { -gtk-icon-size: 22px; }"
+        "button.ctrl-btn.focused:hover { background: #313244; color: #b4befe; }"
         ".cycle-dots { color: #9399b2; font-size: 13px; letter-spacing: 2px; }"
         ".setting-title { font-size: 13px; font-weight: bold; color: #cdd6f4; }"
         "entry.setting-entry { background: #181825; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; font-family: monospace; font-size: 13px; font-weight: bold; min-height: 24px; min-width: 32px; padding: 1px 4px; box-shadow: none; outline: none; }"
@@ -656,6 +1212,12 @@ static gboolean quit_application(gpointer data) {
     if (application != NULL) {
         g_application_quit(G_APPLICATION(application));
     }
+    main_stack = NULL;
+    stats_sub_stack = NULL;
+    stats_today_box = NULL;
+    stats_week_box = NULL;
+    stats_today_summary_lbl = NULL;
+    stats_week_summary_lbl = NULL;
     return G_SOURCE_REMOVE;
 }
 
@@ -665,17 +1227,35 @@ void pom_gtk_quit_async(void) {
 
 int pom_gtk_run(void) {
     is_dev_mode = 0;
+    main_stack = NULL;
+    stats_sub_stack = NULL;
+    stats_today_box = NULL;
+    stats_week_box = NULL;
+    stats_today_summary_lbl = NULL;
+    stats_week_summary_lbl = NULL;
     application = gtk_application_new("io.github.waybarpomodoro.gtk", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "startup", G_CALLBACK(on_startup), NULL);
     g_signal_connect(application, "activate", G_CALLBACK(activate), NULL);
     int status = g_application_run(G_APPLICATION(application), 0, NULL);
     g_object_unref(application);
     application = NULL;
+    main_stack = NULL;
+    stats_sub_stack = NULL;
+    stats_today_box = NULL;
+    stats_week_box = NULL;
+    stats_today_summary_lbl = NULL;
+    stats_week_summary_lbl = NULL;
     return status;
 }
 
 int pom_gtk_dev_run(void) {
     is_dev_mode = 1;
+    main_stack = NULL;
+    stats_sub_stack = NULL;
+    stats_today_box = NULL;
+    stats_week_box = NULL;
+    stats_today_summary_lbl = NULL;
+    stats_week_summary_lbl = NULL;
     g_log_set_writer_func(dev_log_writer, NULL, NULL);
     application = gtk_application_new("io.github.waybarpomodoro.gtkdev", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "startup", G_CALLBACK(on_startup), NULL);
@@ -683,6 +1263,12 @@ int pom_gtk_dev_run(void) {
     int status = g_application_run(G_APPLICATION(application), 0, NULL);
     g_object_unref(application);
     application = NULL;
+    main_stack = NULL;
+    stats_sub_stack = NULL;
+    stats_today_box = NULL;
+    stats_week_box = NULL;
+    stats_today_summary_lbl = NULL;
+    stats_week_summary_lbl = NULL;
     return status;
 }
 

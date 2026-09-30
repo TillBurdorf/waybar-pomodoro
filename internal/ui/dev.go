@@ -24,6 +24,47 @@ type devState struct {
 	summary stats.StatsSummary
 }
 
+func getDevMockSummary() stats.StatsSummary {
+	now := time.Now().Local()
+	weekday := int(now.Weekday())
+	offsetFromMonday := (weekday + 6) % 7
+	monday := now.AddDate(0, 0, -offsetFromMonday)
+
+	todayKey := now.Format("2006-01-02")
+	mockMinutes := []int{120, 90, 60, 45, 100, 0, 0}
+	var weekDays []stats.DayStats
+	totalMin := 0
+
+	for i := 0; i < 7; i++ {
+		d := monday.AddDate(0, 0, i)
+		dKey := d.Format("2006-01-02")
+		isToday := (dKey == todayKey)
+		mins := mockMinutes[i]
+		totalMin += mins
+		weekDays = append(weekDays, stats.DayStats{
+			DayName: d.Format("Mon"),
+			DateStr: d.Format("02 Jan"),
+			Minutes: mins,
+			TimeStr: stats.FormatDuration(mins),
+			IsToday: isToday,
+		})
+	}
+
+	return stats.StatsSummary{
+		TodayCount:   2,
+		TodayMinutes: 60,
+		RecentHistory: []stats.SessionRecord{
+			{Timestamp: now.Add(-1 * time.Hour), Mode: "work", Duration: 1800},
+		},
+		TodayBlocks: []stats.WorkBlock{
+			{StartTime: "10:00", EndTime: "10:30", Duration: 30},
+			{StartTime: "17:00", EndTime: "17:30", Duration: 30},
+		},
+		WeekDays:     weekDays,
+		WeekTotalMin: totalMin,
+	}
+}
+
 var currentDevState = &devState{
 	output: waybar.Output{
 		Mode:      "work",
@@ -31,13 +72,7 @@ var currentDevState = &devState{
 		Total:     25 * 60,
 		Running:   true,
 	},
-	summary: stats.StatsSummary{
-		TodayCount:   3,
-		TodayMinutes: 75,
-		RecentHistory: []stats.SessionRecord{
-			{Timestamp: time.Now().Add(-20 * time.Minute), Mode: "work", Duration: 1500},
-		},
-	},
+	summary: getDevMockSummary(),
 }
 
 //export goGTKDevAction

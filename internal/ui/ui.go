@@ -196,6 +196,35 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 		defer C.free(unsafe.Pointer(cs[i]))
 	}
 	C.pom_gtk_update(cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], C.double(fraction))
+
+	todaySumText := fmt.Sprintf("%d sessions · %s focus", summary.TodayCount, stats.FormatDuration(summary.TodayMinutes))
+	todaySummaryC := C.CString(todaySumText)
+	defer C.free(unsafe.Pointer(todaySummaryC))
+
+	var blockLines []string
+	for _, b := range summary.TodayBlocks {
+		durStr := stats.FormatDuration(b.Duration)
+		blockLines = append(blockLines, fmt.Sprintf("%s|%s|%s", b.StartTime, b.EndTime, durStr))
+	}
+	todayBlocksC := C.CString(strings.Join(blockLines, "\n"))
+	defer C.free(unsafe.Pointer(todayBlocksC))
+
+	weekSumText := fmt.Sprintf("This Week: %s total", stats.FormatDuration(summary.WeekTotalMin))
+	weekSummaryC := C.CString(weekSumText)
+	defer C.free(unsafe.Pointer(weekSummaryC))
+
+	var dayLines []string
+	for _, d := range summary.WeekDays {
+		isToday := 0
+		if d.IsToday {
+			isToday = 1
+		}
+		dayLines = append(dayLines, fmt.Sprintf("%s|%s|%d|%s|%d", d.DayName, d.DateStr, d.Minutes, d.TimeStr, isToday))
+	}
+	weekDaysC := C.CString(strings.Join(dayLines, "\n"))
+	defer C.free(unsafe.Pointer(weekDaysC))
+
+	C.pom_gtk_update_stats(todaySummaryC, todayBlocksC, weekSummaryC, weekDaysC)
 }
 
 func subscribeToDaemon(outChan chan<- waybar.Output, done <-chan struct{}) {
