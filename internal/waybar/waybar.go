@@ -19,10 +19,6 @@ type Output struct {
 func Format(mode string, remainingSec int, totalSec int, running bool) string {
 	mins := remainingSec / 60
 	secs := remainingSec % 60
-	icon := "🍅"
-	if mode == "break" {
-		icon = "☕"
-	}
 
 	statusClass := "stopped"
 	if running {
@@ -30,8 +26,8 @@ func Format(mode string, remainingSec int, totalSec int, running bool) string {
 	}
 
 	out := Output{
-		Text:      fmt.Sprintf("%02d:%02d %s", mins, secs, icon),
-		Alt:       mode,
+		Text:      fmt.Sprintf("%02d:%02d", mins, secs), // Pure time text, no icons
+		Alt:       mode,                                 // Used by Waybar to select format-icons
 		Tooltip:   fmt.Sprintf("Mode: %s | Status: %s", mode, statusClass),
 		Class:     fmt.Sprintf("%s-%s", mode, statusClass),
 		Mode:      mode,

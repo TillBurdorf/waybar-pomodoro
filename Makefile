@@ -1,4 +1,4 @@
-.PHONY: build install dev clean
+.PHONY: build install restart dev clean
 
 build:
 	go build -o waybar-pomodoro ./cmd/waybar-pomodoro
@@ -6,6 +6,10 @@ build:
 install: build
 	mkdir -p ~/.local/bin
 	mv waybar-pomodoro ~/.local/bin/
+	-pkill -f "waybar-pomodoro daemon"
+
+restart:
+	-pkill -f "waybar-pomodoro daemon"
 
 dev:
 	@chmod +x dev.sh
@@ -13,3 +17,4 @@ dev:
 
 clean:
 	rm -f waybar-pomodoro
+
