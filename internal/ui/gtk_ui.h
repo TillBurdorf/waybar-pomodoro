@@ -3,6 +3,7 @@
 
 int pom_gtk_run(void);
 int pom_gtk_dev_run(void);
+int pom_gtk_run_toast(const char *title, const char *message);
 void pom_gtk_update(const char *mode, const char *timer, const char *status,
                     const char *progress, const char *cycle,
                     const char *stats, const char *history, double fraction);
@@ -10,6 +11,7 @@ void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_da
                           const char *week_summary, const char *week_days_data);
 void pom_gtk_quit_async(void);
 void pom_gtk_set_initial_durations(int work_min, int break_min);
+void pom_gtk_set_initial_settings(int work_min, int break_min, int long_break_min, int total_cycles);
 void pom_gtk_dev_show_fallback_error(const char *error_msg);
 void pom_gtk_dev_load_module(const char *so_path);
 void pom_gtk_dev_show_compile_error(const char *error_msg);
@@ -19,5 +21,6 @@ void pom_gtk_reload_css(void);
 extern void goGTKCommand(char *command);
 extern void goGTKDevAction(char *action);
 extern void goGTKSetDurations(int work_min, int break_min);
+extern void goGTKSetSettings(int work_min, int break_min, int long_break_min, int total_cycles);
 
 #endif

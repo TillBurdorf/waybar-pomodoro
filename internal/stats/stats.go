@@ -16,6 +16,7 @@ type SessionRecord struct {
 }
 
 type WorkBlock struct {
+	Index     int    `json:"index"`
 	StartTime string // "10:00"
 	EndTime   string // "10:30"
 	Duration  int    // minutes
@@ -129,6 +130,7 @@ func GetStats() (StatsSummary, error) {
 	}
 
 	// Today's workblocks in chronological order
+	blockIdx := 0
 	for _, rec := range allRecords {
 		if rec.Mode == "work" && rec.Timestamp.Local().Format("2006-01-02") == today {
 			mins := rec.Duration / 60
@@ -138,10 +140,12 @@ func GetStats() (StatsSummary, error) {
 			endTime := rec.Timestamp.Local()
 			startTime := endTime.Add(-time.Duration(rec.Duration) * time.Second)
 			summary.TodayBlocks = append(summary.TodayBlocks, WorkBlock{
+				Index:     blockIdx,
 				StartTime: startTime.Format("15:04"),
 				EndTime:   endTime.Format("15:04"),
 				Duration:  mins,
 			})
+			blockIdx++
 		}
 	}
 
@@ -174,6 +178,60 @@ func GetStats() (StatsSummary, error) {
 	}
 
 	return summary, nil
+}
+
+func DeleteTodayBlock(index int) error {
+	filePath, err := getStatsFilePath()
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(filePath)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(file)
+	today := time.Now().Format("2006-01-02")
+	var records []SessionRecord
+	todayWorkCount := 0
+
+	for scanner.Scan() {
+		var rec SessionRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err == nil {
+			if rec.Mode == "work" && rec.Timestamp.Local().Format("2006-01-02") == today {
+				if todayWorkCount == index {
+					todayWorkCount++
+					continue
+				}
+				todayWorkCount++
+			}
+			records = append(records, rec)
+		}
+	}
+	file.Close()
+
+	tmpPath := filePath + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range records {
+		bytes, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		if _, err := tmpFile.Write(append(bytes, '\n')); err != nil {
+			tmpFile.Close()
+			return err
+		}
+	}
+	tmpFile.Close()
+
+	return os.Rename(tmpPath, filePath)
 }
 
 func ShowStats() error {

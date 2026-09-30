@@ -33,6 +33,15 @@ func main() {
 			fmt.Println("Error:", err)
 			os.Exit(1)
 		}
+	case "delete_block", "delete-block":
+		fullCmd := cmd
+		if len(os.Args) > 2 {
+			fullCmd = fmt.Sprintf("delete_block %s", os.Args[2])
+		}
+		if err := ipc.SendCommand(fullCmd); err != nil {
+			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
 	case "stats":
 		if err := stats.ShowStats(); err != nil {
 			fmt.Println("Error showing stats:", err)
@@ -41,6 +50,19 @@ func main() {
 	case "dev":
 		if err := ui.RunDevUI(); err != nil {
 			fmt.Println("Error:", err)
+			os.Exit(1)
+		}
+	case "toast":
+		title := "Pomodoro Alert"
+		msg := ""
+		if len(os.Args) >= 3 {
+			title = os.Args[2]
+		}
+		if len(os.Args) >= 4 {
+			msg = os.Args[3]
+		}
+		if err := ui.RunToast(title, msg); err != nil {
+			fmt.Println("Error showing toast:", err)
 			os.Exit(1)
 		}
 	default:

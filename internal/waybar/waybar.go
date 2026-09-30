@@ -20,16 +20,27 @@ func Format(mode string, remainingSec int, totalSec int, running bool) string {
 	mins := remainingSec / 60
 	secs := remainingSec % 60
 
+	altMode := mode
+	if mode == "long_break" {
+		altMode = "break"
+	}
+
 	statusClass := "stopped"
 	if running {
 		statusClass = "running"
+		altMode = fmt.Sprintf("%s-running", altMode)
+	}
+
+	text := fmt.Sprintf("%02d:%02d", mins, secs)
+	if running {
+		text = fmt.Sprintf("<span color=\"#a6e3a1\">%02d:%02d</span>", mins, secs)
 	}
 
 	out := Output{
-		Text:      fmt.Sprintf("%02d:%02d", mins, secs), // Pure time text, no icons
-		Alt:       mode,                                 // Used by Waybar to select format-icons
+		Text:      text,
+		Alt:       altMode,
 		Tooltip:   fmt.Sprintf("Mode: %s | Status: %s", mode, statusClass),
-		Class:     fmt.Sprintf("%s-%s", mode, statusClass),
+		Class:     fmt.Sprintf("%s-%s %s", mode, statusClass, statusClass),
 		Mode:      mode,
 		Remaining: remainingSec,
 		Total:     totalSec,

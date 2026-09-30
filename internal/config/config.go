@@ -7,14 +7,18 @@ import (
 )
 
 type Config struct {
-	WorkDurationMinutes  int `json:"work_duration_minutes"`
-	BreakDurationMinutes int `json:"break_duration_minutes"`
+	WorkDurationMinutes      int `json:"work_duration_minutes"`
+	BreakDurationMinutes     int `json:"break_duration_minutes"`
+	LongBreakDurationMinutes int `json:"long_break_duration_minutes"`
+	TotalCycles              int `json:"total_cycles"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		WorkDurationMinutes:  25,
-		BreakDurationMinutes: 5,
+		WorkDurationMinutes:      25,
+		BreakDurationMinutes:     5,
+		LongBreakDurationMinutes: 15,
+		TotalCycles:              4,
 	}
 }
 
@@ -51,6 +55,12 @@ func Load() Config {
 	if cfg.BreakDurationMinutes <= 0 {
 		cfg.BreakDurationMinutes = 5
 	}
+	if cfg.LongBreakDurationMinutes <= 0 {
+		cfg.LongBreakDurationMinutes = 15
+	}
+	if cfg.TotalCycles <= 0 {
+		cfg.TotalCycles = 4
+	}
 	return cfg
 }
 
@@ -60,6 +70,12 @@ func Save(cfg Config) error {
 	}
 	if cfg.BreakDurationMinutes <= 0 {
 		cfg.BreakDurationMinutes = 5
+	}
+	if cfg.LongBreakDurationMinutes <= 0 {
+		cfg.LongBreakDurationMinutes = 15
+	}
+	if cfg.TotalCycles <= 0 {
+		cfg.TotalCycles = 4
 	}
 	path, err := getConfigPath()
 	if err != nil {

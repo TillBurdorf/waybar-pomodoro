@@ -103,19 +103,12 @@ You can style the module based on its status classes:
 ```css
 #custom-pomodoro {
     padding: 0 10px;
-    color: #cdd6f4;
+    color: #cdd6f4; /* Default Catppuccin Mocha Text when paused */
 }
 
-#custom-pomodoro.work-running {
-    color: #a6e3a1; /* Green when focusing */
-}
-
-#custom-pomodoro.work-stopped {
-    color: #f9e2af; /* Yellow when paused */
-}
-
-#custom-pomodoro.break-running {
-    color: #89b4fa; /* Blue during break */
+/* Green when timer is running */
+#custom-pomodoro.running {
+    color: #a6e3a1; /* Catppuccin Mocha Green */
 }
 ```
 

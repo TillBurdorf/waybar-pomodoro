@@ -22,6 +22,7 @@ import (
 	"time"
 	"unsafe"
 
+	"waybar-pomodoro/internal/config"
 	"waybar-pomodoro/internal/stats"
 	"waybar-pomodoro/internal/waybar"
 )
@@ -65,8 +66,8 @@ func getDevMockSummary() stats.StatsSummary {
 			{Timestamp: now.Add(-1 * time.Hour), Mode: "work", Duration: 1800},
 		},
 		TodayBlocks: []stats.WorkBlock{
-			{StartTime: "10:00", EndTime: "10:30", Duration: 30},
-			{StartTime: "17:00", EndTime: "17:30", Duration: 30},
+			{Index: 0, StartTime: "10:00", EndTime: "10:30", Duration: 30},
+			{Index: 1, StartTime: "17:00", EndTime: "17:30", Duration: 30},
 		},
 		WeekDays:     weekDays,
 		WeekTotalMin: totalMin,
@@ -156,6 +157,24 @@ func (s *devState) handleAction(action string) {
 		}
 	case "refresh_state":
 		// In-place UI reload: re-apply current output & summary to new card widgets
+	}
+
+	if strings.HasPrefix(action, "delete_block ") {
+		var idx int
+		if _, err := fmt.Sscanf(action, "delete_block %d", &idx); err == nil && idx >= 0 {
+			if idx < len(s.summary.TodayBlocks) {
+				block := s.summary.TodayBlocks[idx]
+				s.summary.TodayBlocks = append(s.summary.TodayBlocks[:idx], s.summary.TodayBlocks[idx+1:]...)
+				for i := range s.summary.TodayBlocks {
+					s.summary.TodayBlocks[i].Index = i
+				}
+				s.summary.TodayCount = len(s.summary.TodayBlocks)
+				s.summary.TodayMinutes -= block.Duration
+				if s.summary.TodayMinutes < 0 {
+					s.summary.TodayMinutes = 0
+				}
+			}
+		}
 	}
 
 	updateGTK(s.output, s.summary)
@@ -270,15 +289,29 @@ func RunDevUI() error {
 						currentDevState.output.Remaining--
 					} else {
 						if currentDevState.output.Mode == "work" {
-							currentDevState.output.Mode = "break"
-							currentDevState.output.Total = 5 * 60
-							currentDevState.output.Remaining = 5 * 60
 							currentDevState.summary.TodayCount++
 							currentDevState.summary.TodayMinutes += 25
+							cfg := config.Load()
+							tc := cfg.TotalCycles
+							if tc <= 0 {
+								tc = 4
+							}
+							if currentDevState.summary.TodayCount%tc == 0 {
+								currentDevState.output.Mode = "long_break"
+								currentDevState.output.Total = cfg.LongBreakDurationMinutes * 60
+								currentDevState.output.Remaining = cfg.LongBreakDurationMinutes * 60
+							} else {
+								currentDevState.output.Mode = "break"
+								currentDevState.output.Total = cfg.BreakDurationMinutes * 60
+								currentDevState.output.Remaining = cfg.BreakDurationMinutes * 60
+							}
+							currentDevState.output.Running = true
 						} else {
+							cfg := config.Load()
 							currentDevState.output.Mode = "work"
-							currentDevState.output.Total = 25 * 60
-							currentDevState.output.Remaining = 25 * 60
+							currentDevState.output.Total = cfg.WorkDurationMinutes * 60
+							currentDevState.output.Remaining = cfg.WorkDurationMinutes * 60
+							currentDevState.output.Running = true
 						}
 					}
 					out := currentDevState.output

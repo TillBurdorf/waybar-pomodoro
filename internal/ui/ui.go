@@ -38,13 +38,30 @@ func goGTKCommand(command *C.char) {
 func goGTKSetDurations(workMin, breakMin C.int) {
 	w := int(workMin)
 	b := int(breakMin)
+	cfg := config.Load()
+	cfg.WorkDurationMinutes = w
+	cfg.BreakDurationMinutes = b
+	_ = config.Save(cfg)
+	go func() {
+		_ = ipc.SendCommand(fmt.Sprintf("set_settings %d %d %d %d", w, b, cfg.LongBreakDurationMinutes, cfg.TotalCycles))
+	}()
+}
+
+//export goGTKSetSettings
+func goGTKSetSettings(workMin, breakMin, longBreakMin, totalCycles C.int) {
+	w := int(workMin)
+	b := int(breakMin)
+	lb := int(longBreakMin)
+	tc := int(totalCycles)
 	cfg := config.Config{
-		WorkDurationMinutes:  w,
-		BreakDurationMinutes: b,
+		WorkDurationMinutes:      w,
+		BreakDurationMinutes:     b,
+		LongBreakDurationMinutes: lb,
+		TotalCycles:              tc,
 	}
 	_ = config.Save(cfg)
 	go func() {
-		_ = ipc.SendCommand(fmt.Sprintf("set_durations %d %d", w, b))
+		_ = ipc.SendCommand(fmt.Sprintf("set_settings %d %d %d %d", w, b, lb, tc))
 	}()
 }
 
@@ -132,7 +149,7 @@ func RunUI() error {
 	}()
 
 	cfg := config.Load()
-	C.pom_gtk_set_initial_durations(C.int(cfg.WorkDurationMinutes), C.int(cfg.BreakDurationMinutes))
+	C.pom_gtk_set_initial_settings(C.int(cfg.WorkDurationMinutes), C.int(cfg.BreakDurationMinutes), C.int(cfg.LongBreakDurationMinutes), C.int(cfg.TotalCycles))
 
 	status := C.pom_gtk_run()
 	stop()
@@ -147,10 +164,30 @@ func RunGTKUI() error {
 	return RunUI()
 }
 
+// RunToast launches a small floating GTK4 toast alert window.
+func RunToast(title, message string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cTitle := C.CString(title)
+	defer C.free(unsafe.Pointer(cTitle))
+
+	cMsg := C.CString(message)
+	defer C.free(unsafe.Pointer(cMsg))
+
+	status := C.pom_gtk_run_toast(cTitle, cMsg)
+	if status != 0 {
+		return fmt.Errorf("GTK toast exited with status %d", int(status))
+	}
+	return nil
+}
+
 func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 	modeName := "FOCUS"
 	if state.Mode == "break" {
-		modeName = "BREAK"
+		modeName = "SHORT BREAK"
+	} else if state.Mode == "long_break" {
+		modeName = "LONG BREAK"
 	}
 	status := "Paused"
 	if state.Running {
@@ -161,6 +198,8 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 		total = 25 * 60
 		if state.Mode == "break" {
 			total = 5 * 60
+		} else if state.Mode == "long_break" {
+			total = 15 * 60
 		}
 	}
 	elapsed := total - state.Remaining
@@ -170,7 +209,17 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 		elapsed = total
 	}
 	fraction := float64(elapsed) / float64(total)
-	dots := strings.Repeat("●  ", summary.TodayCount%4) + strings.Repeat("○  ", 4-summary.TodayCount%4)
+
+	cfg := config.Load()
+	totCycles := cfg.TotalCycles
+	if totCycles <= 0 {
+		totCycles = 4
+	}
+	completedInSet := summary.TodayCount % totCycles
+	if state.Mode == "long_break" {
+		completedInSet = totCycles
+	}
+	dots := strings.Repeat("●  ", completedInSet) + strings.Repeat("○  ", totCycles-completedInSet)
 	cycleText := strings.TrimSpace(dots)
 	history := "No sessions yet today"
 	if len(summary.RecentHistory) > 0 {
@@ -204,7 +253,7 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 	var blockLines []string
 	for _, b := range summary.TodayBlocks {
 		durStr := stats.FormatDuration(b.Duration)
-		blockLines = append(blockLines, fmt.Sprintf("%s|%s|%s", b.StartTime, b.EndTime, durStr))
+		blockLines = append(blockLines, fmt.Sprintf("%d|%s|%s|%s", b.Index, b.StartTime, b.EndTime, durStr))
 	}
 	todayBlocksC := C.CString(strings.Join(blockLines, "\n"))
 	defer C.free(unsafe.Pointer(todayBlocksC))
