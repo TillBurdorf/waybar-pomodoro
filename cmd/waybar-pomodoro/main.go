@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"waybar-pomodoro/internal/ipc"
 	"waybar-pomodoro/internal/stats"
@@ -41,6 +42,30 @@ func main() {
 		if err := ipc.SendCommand(fullCmd); err != nil {
 			fmt.Println("Error:", err)
 			os.Exit(1)
+		}
+	case "set_block_project", "set-block-project":
+		if len(os.Args) > 2 {
+			fullCmd := fmt.Sprintf("set_block_project %s", strings.Join(os.Args[2:], " "))
+			if err := ipc.SendCommand(fullCmd); err != nil {
+				fmt.Println("Error:", err)
+				os.Exit(1)
+			}
+		}
+	case "add_session", "add-session":
+		if len(os.Args) > 2 {
+			fullCmd := fmt.Sprintf("add_session %s", strings.Join(os.Args[2:], " "))
+			if err := ipc.SendCommand(fullCmd); err != nil {
+				fmt.Println("Error:", err)
+				os.Exit(1)
+			}
+		}
+	case "edit_block", "edit-block", "edit_session", "edit-session":
+		if len(os.Args) > 2 {
+			fullCmd := fmt.Sprintf("edit_block %s", strings.Join(os.Args[2:], " "))
+			if err := ipc.SendCommand(fullCmd); err != nil {
+				fmt.Println("Error:", err)
+				os.Exit(1)
+			}
 		}
 	case "stats":
 		if err := stats.ShowStats(); err != nil {

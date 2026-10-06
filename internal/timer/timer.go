@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +30,7 @@ type Timer struct {
 	totalCycles       int    // number of circles per set
 	completedCycles   int    // completed sessions in current set
 	running           bool
+	sessionStartTime  time.Time
 	subscribers       map[net.Conn]struct{}
 }
 
@@ -76,15 +78,148 @@ func (t *Timer) broadcastLocked() {
 	}
 }
 
+func (t *Timer) Toggle() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.running = !t.running
+	if t.running && t.mode == "work" && t.sessionStartTime.IsZero() {
+		t.sessionStartTime = time.Now()
+	}
+	t.broadcastLocked()
+}
+
+func (t *Timer) Stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.running = false
+	t.mode = "work"
+	t.remaining = t.workDuration
+	t.sessionStartTime = time.Time{}
+	t.broadcastLocked()
+}
+
+func (t *Timer) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.running = false
+	if t.mode == "break" {
+		t.remaining = t.breakDuration
+	} else if t.mode == "long_break" {
+		t.remaining = t.longBreakDuration
+	} else {
+		t.remaining = t.workDuration
+	}
+	t.sessionStartTime = time.Time{}
+	t.broadcastLocked()
+}
+
+func (t *Timer) Skip() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.skipLocked()
+}
+
+func (t *Timer) skipLocked() {
+	t.running = false
+	if t.mode == "work" {
+		elapsed := t.workDuration - t.remaining
+		if elapsed < 0 {
+			elapsed = 0
+		} else if elapsed > t.workDuration {
+			elapsed = t.workDuration
+		}
+
+		if elapsed > 0 {
+			now := time.Now()
+			start := t.sessionStartTime
+			if start.IsZero() {
+				start = now.Add(-time.Duration(elapsed) * time.Second)
+			}
+			_ = stats.LogSessionWithTimes("work", elapsed, start, now)
+			t.completedCycles++
+			if t.completedCycles >= t.totalCycles {
+				t.mode = "long_break"
+				t.remaining = t.longBreakDuration
+			} else {
+				t.mode = "break"
+				t.remaining = t.breakDuration
+			}
+		} else {
+			t.mode = "break"
+			t.remaining = t.breakDuration
+		}
+		t.sessionStartTime = time.Time{}
+	} else if t.mode == "break" {
+		t.mode = "work"
+		t.remaining = t.workDuration
+		t.sessionStartTime = time.Time{}
+	} else if t.mode == "long_break" {
+		t.completedCycles = 0
+		t.mode = "work"
+		t.remaining = t.workDuration
+		t.sessionStartTime = time.Time{}
+	}
+	t.broadcastLocked()
+}
+
+func (t *Timer) Mode() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mode
+}
+
+func (t *Timer) Remaining() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.remaining
+}
+
+func (t *Timer) CompletedCycles() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.completedCycles
+}
+
+func (t *Timer) Running() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.running
+}
+
+func (t *Timer) SessionStartTime() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sessionStartTime
+}
+
+func (t *Timer) SetStateForTest(mode string, remaining int, completedCycles int, running bool, sessionStartTime time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mode = mode
+	t.remaining = remaining
+	t.completedCycles = completedCycles
+	t.running = running
+	t.sessionStartTime = sessionStartTime
+}
+
 func (t *Timer) Tick() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.running {
+		if t.mode == "work" && t.sessionStartTime.IsZero() {
+			t.sessionStartTime = time.Now()
+		}
 		t.remaining--
 		if t.remaining <= 0 {
 			if t.mode == "work" {
-				_ = stats.LogSession("work", t.workDuration)
+				now := time.Now()
+				start := t.sessionStartTime
+				if start.IsZero() {
+					start = now.Add(-time.Duration(t.workDuration) * time.Second)
+				}
+				_ = stats.LogSessionWithTimes("work", t.workDuration, start, now)
+				t.sessionStartTime = time.Time{}
 				t.completedCycles++
 				if t.completedCycles >= t.totalCycles {
 					t.mode = "long_break"
@@ -107,6 +242,7 @@ func (t *Timer) Tick() {
 				t.mode = "work"
 				t.remaining = t.workDuration
 				t.running = true
+				t.sessionStartTime = time.Now()
 				go func() {
 					triggerToast("Break Ended! ☕", "Starting next focus session!")
 					playNotificationSound("message-new-instant")
@@ -116,6 +252,7 @@ func (t *Timer) Tick() {
 				t.mode = "work"
 				t.remaining = t.workDuration
 				t.running = true
+				t.sessionStartTime = time.Now()
 				go func() {
 					triggerToast("Long Break Ended! ☕", "Resetting cycles. Starting next focus session!")
 					playNotificationSound("message-new-instant")
@@ -155,52 +292,22 @@ func (t *Timer) handleConnection(conn net.Conn) {
 		conn.Close()
 
 	case cmd == "toggle":
-		t.mu.Lock()
-		t.running = !t.running
-		t.broadcastLocked()
-		t.mu.Unlock()
-
+		t.Toggle()
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
 	case cmd == "stop":
-		t.mu.Lock()
-		t.running = false
-		t.mode = "work"
-		t.remaining = t.workDuration
-		t.broadcastLocked()
-		t.mu.Unlock()
-
+		t.Stop()
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
 	case cmd == "reset":
-		t.mu.Lock()
-		t.running = false
-		if t.mode == "break" {
-			t.remaining = t.breakDuration
-		} else {
-			t.remaining = t.workDuration
-		}
-		t.broadcastLocked()
-		t.mu.Unlock()
-
+		t.Reset()
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
 	case cmd == "skip":
-		t.mu.Lock()
-		t.running = false
-		if t.mode == "work" {
-			t.mode = "break"
-			t.remaining = t.breakDuration
-		} else {
-			t.mode = "work"
-			t.remaining = t.workDuration
-		}
-		t.broadcastLocked()
-		t.mu.Unlock()
-
+		t.Skip()
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()
 
@@ -273,6 +380,69 @@ func (t *Timer) handleConnection(conn net.Conn) {
 			t.mu.Lock()
 			t.broadcastLocked()
 			t.mu.Unlock()
+		}
+		_, _ = fmt.Fprintln(conn, "OK")
+		conn.Close()
+
+	case strings.HasPrefix(cmd, "set_block_project "):
+		parts := strings.SplitN(cmd, " ", 3)
+		if len(parts) >= 2 {
+			idx, err := strconv.Atoi(parts[1])
+			proj := ""
+			if len(parts) >= 3 {
+				proj = strings.TrimSpace(parts[2])
+			}
+			if err == nil && idx >= 0 {
+				_ = stats.SetTodayBlockProject(idx, proj)
+				t.mu.Lock()
+				t.broadcastLocked()
+				t.mu.Unlock()
+			}
+		}
+		_, _ = fmt.Fprintln(conn, "OK")
+		conn.Close()
+
+	case strings.HasPrefix(cmd, "add_session "):
+		parts := strings.Split(strings.TrimPrefix(cmd, "add_session "), " ")
+		if len(parts) >= 3 {
+			start := strings.TrimSpace(parts[0])
+			end := strings.TrimSpace(parts[1])
+			dur, _ := strconv.Atoi(parts[2])
+			proj := ""
+			if len(parts) >= 4 {
+				proj = strings.TrimSpace(strings.Join(parts[3:], " "))
+			}
+			if proj == "-" {
+				proj = ""
+			}
+			_ = stats.AddManualSession(start, end, dur, proj)
+			t.mu.Lock()
+			t.broadcastLocked()
+			t.mu.Unlock()
+		}
+		_, _ = fmt.Fprintln(conn, "OK")
+		conn.Close()
+
+	case strings.HasPrefix(cmd, "edit_block "):
+		parts := strings.Split(strings.TrimPrefix(cmd, "edit_block "), " ")
+		if len(parts) >= 4 {
+			idx, err := strconv.Atoi(parts[0])
+			start := strings.TrimSpace(parts[1])
+			end := strings.TrimSpace(parts[2])
+			dur, _ := strconv.Atoi(parts[3])
+			proj := ""
+			if len(parts) >= 5 {
+				proj = strings.TrimSpace(strings.Join(parts[4:], " "))
+			}
+			if proj == "-" {
+				proj = ""
+			}
+			if err == nil && idx >= 0 {
+				_ = stats.UpdateTodayBlock(idx, start, end, dur, proj)
+				t.mu.Lock()
+				t.broadcastLocked()
+				t.mu.Unlock()
+			}
 		}
 		_, _ = fmt.Fprintln(conn, "OK")
 		conn.Close()

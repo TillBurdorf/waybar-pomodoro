@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include "gtk_ui.h"
 
@@ -11,11 +12,13 @@ typedef GtkWidget *(*DevBuildCardFn)(void);
 typedef void (*DevReloadCssFn)(void);
 typedef void (*DevUpdateFn)(const char *, const char *, const char *, const char *, const char *, const char *, const char *, double);
 typedef void (*DevUpdateStatsFn)(const char *, const char *, const char *, const char *);
+typedef void (*DevUpdateProjectsFn)(const char *, const char *, const char *);
 typedef gboolean (*DevKeyFn)(GtkEventControllerKey *, guint, guint, GdkModifierType, gpointer);
 
 static void *current_dev_module_handle = NULL;
 static DevUpdateFn active_update_fn = NULL;
 static DevUpdateStatsFn active_update_stats_fn = NULL;
+static DevUpdateProjectsFn active_update_projects_fn = NULL;
 static DevKeyFn active_key_dev_fn = NULL;
 static GtkWidget *dev_card_frame = NULL;
 
@@ -31,6 +34,12 @@ static GtkWidget *stats_today_summary_lbl = NULL;
 static GtkWidget *stats_today_box = NULL;
 static GtkWidget *stats_week_summary_lbl = NULL;
 static GtkWidget *stats_week_box = NULL;
+static GtkWidget *stats_proj_dropdown = NULL;
+static GtkWidget *stats_proj_summary_lbl = NULL;
+static GtkWidget *stats_proj_box = NULL;
+static char *cached_all_projects = NULL;
+static char *cached_project_summaries = NULL;
+static char *cached_past_sessions = NULL;
 static GtkWidget *timer_buttons[4] = {NULL, NULL, NULL, NULL};
 static const char *timer_button_commands[4] = {"toggle", "skip", "reset", "stop"};
 static int focused_timer_button_idx = 0;
@@ -38,6 +47,7 @@ static GtkWidget *setting_entries[4] = {NULL, NULL, NULL, NULL};
 static double current_progress_fraction = 0.0;
 static int current_is_break = 0;
 static int is_dev_mode = 0;
+static GtkWidget *make_label(const char *text, const char *css_class);
 
 static int work_duration_val = 25;
 static int break_duration_val = 5;
@@ -242,6 +252,542 @@ typedef struct {
     char *week_days;
 } StatsUpdate;
 
+typedef struct {
+    int block_idx;
+    char *orig_start;
+    char *orig_end;
+    int orig_dur;
+    char *orig_proj;
+    GtkWidget *popover;
+    GtkWidget *start_entry;
+    GtkWidget *end_entry;
+    GtkWidget *dur_entry;
+    GtkWidget *proj_entry;
+    gboolean is_updating;
+} EditSessionData;
+
+static void free_edit_session_data(gpointer data) {
+    EditSessionData *d = (EditSessionData *)data;
+    if (d != NULL) {
+        g_free(d->orig_start);
+        g_free(d->orig_end);
+        g_free(d->orig_proj);
+        g_free(d);
+    }
+}
+
+static void on_edit_session_time_changed(GtkEditable *editable, gpointer user_data) {
+    (void)editable;
+    EditSessionData *d = (EditSessionData *)user_data;
+    if (d == NULL || d->is_updating) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *et = gtk_editable_get_text(GTK_EDITABLE(d->end_entry));
+    if (st == NULL || et == NULL || strlen(st) < 4 || strlen(et) < 4) return;
+
+    int sh = 0, sm = 0, eh = 0, em = 0;
+    if (sscanf(st, "%d:%d", &sh, &sm) == 2 && sscanf(et, "%d:%d", &eh, &em) == 2) {
+        int diff = (eh * 60 + em) - (sh * 60 + sm);
+        if (diff < 0) diff += 24 * 60;
+        if (diff > 0 && diff <= 1440) {
+            d->is_updating = TRUE;
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", diff);
+            gtk_editable_set_text(GTK_EDITABLE(d->dur_entry), buf);
+            d->is_updating = FALSE;
+        }
+    }
+}
+
+static void on_edit_session_dur_changed(GtkEditable *editable, gpointer user_data) {
+    (void)editable;
+    EditSessionData *d = (EditSessionData *)user_data;
+    if (d == NULL || d->is_updating) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *dt = gtk_editable_get_text(GTK_EDITABLE(d->dur_entry));
+    if (st == NULL || dt == NULL || strlen(st) < 4 || strlen(dt) == 0) return;
+
+    int sh = 0, sm = 0;
+    int dur = atoi(dt);
+    if (sscanf(st, "%d:%d", &sh, &sm) == 2 && dur > 0 && dur <= 1440) {
+        int total_m = (sh * 60 + sm + dur) % (24 * 60);
+        int eh = total_m / 60;
+        int em = total_m % 60;
+        d->is_updating = TRUE;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d", eh, em);
+        gtk_editable_set_text(GTK_EDITABLE(d->end_entry), buf);
+        d->is_updating = FALSE;
+    }
+}
+
+static void on_edit_project_chip_clicked(GtkButton *btn, gpointer user_data) {
+    EditSessionData *d = (EditSessionData *)user_data;
+    const char *label = gtk_button_get_label(btn);
+    if (label != NULL && d != NULL && d->proj_entry != NULL) {
+        gtk_editable_set_text(GTK_EDITABLE(d->proj_entry), label);
+    }
+}
+
+static void edit_session_submit(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    EditSessionData *d = (EditSessionData *)user_data;
+    if (d == NULL) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *et = gtk_editable_get_text(GTK_EDITABLE(d->end_entry));
+    const char *dt = gtk_editable_get_text(GTK_EDITABLE(d->dur_entry));
+    const char *pt = gtk_editable_get_text(GTK_EDITABLE(d->proj_entry));
+
+    char start_buf[16] = "00:00";
+    char end_buf[16] = "00:00";
+    int dur = (dt != NULL) ? atoi(dt) : 0;
+
+    if (st != NULL && strlen(st) >= 3) {
+        strncpy(start_buf, st, sizeof(start_buf) - 1);
+    } else if (d->orig_start != NULL && strlen(d->orig_start) >= 3) {
+        strncpy(start_buf, d->orig_start, sizeof(start_buf) - 1);
+    }
+
+    if (et != NULL && strlen(et) >= 3) {
+        strncpy(end_buf, et, sizeof(end_buf) - 1);
+    } else if (d->orig_end != NULL && strlen(d->orig_end) >= 3) {
+        strncpy(end_buf, d->orig_end, sizeof(end_buf) - 1);
+    }
+
+    if (dur <= 0) {
+        int sh = 0, sm = 0, eh = 0, em = 0;
+        if (sscanf(start_buf, "%d:%d", &sh, &sm) == 2 && sscanf(end_buf, "%d:%d", &eh, &em) == 2) {
+            dur = (eh * 60 + em) - (sh * 60 + sm);
+            if (dur < 0) dur += 24 * 60;
+        }
+        if (dur <= 0) dur = (d->orig_dur > 0) ? d->orig_dur : 25;
+    }
+
+    const char *proj_str = (pt != NULL && strlen(pt) > 0) ? pt : "-";
+
+    char *cmd = g_strdup_printf("edit_block %d %s %s %d %s", d->block_idx, start_buf, end_buf, dur, proj_str);
+
+    if (is_dev_mode) {
+        goGTKDevAction(cmd);
+    } else {
+        goGTKCommand(cmd);
+    }
+    g_free(cmd);
+
+    if (d->popover != NULL) {
+        gtk_popover_popdown(GTK_POPOVER(d->popover));
+    }
+}
+
+static void on_edit_session_popover_show(GtkWidget *popover, gpointer user_data) {
+    (void)popover;
+    EditSessionData *d = (EditSessionData *)user_data;
+    if (d == NULL) return;
+
+    d->is_updating = TRUE;
+    gtk_editable_set_text(GTK_EDITABLE(d->start_entry), d->orig_start ? d->orig_start : "");
+    gtk_editable_set_text(GTK_EDITABLE(d->end_entry), d->orig_end ? d->orig_end : "");
+    char dur_buf[16];
+    snprintf(dur_buf, sizeof(dur_buf), "%d", d->orig_dur > 0 ? d->orig_dur : 25);
+    gtk_editable_set_text(GTK_EDITABLE(d->dur_entry), dur_buf);
+    gtk_editable_set_text(GTK_EDITABLE(d->proj_entry), d->orig_proj ? d->orig_proj : "");
+    d->is_updating = FALSE;
+}
+
+static GtkWidget *create_edit_session_popover(int block_idx, const char *start_time, const char *end_time, int dur_min, const char *current_proj) {
+    GtkWidget *pop = gtk_popover_new();
+    gtk_widget_add_css_class(pop, "session-popover");
+    gtk_popover_set_position(GTK_POPOVER(pop), GTK_POS_BOTTOM);
+
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_size_request(content, 220, -1);
+    gtk_widget_set_margin_start(content, 10);
+    gtk_widget_set_margin_end(content, 10);
+    gtk_widget_set_margin_top(content, 10);
+    gtk_widget_set_margin_bottom(content, 10);
+
+    GtkWidget *title = make_label("Edit Session", "project-popover-title");
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
+    gtk_box_append(GTK_BOX(content), title);
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_append(GTK_BOX(content), sep);
+
+    EditSessionData *data = g_new0(EditSessionData, 1);
+    data->block_idx = block_idx;
+    data->orig_start = g_strdup(start_time ? start_time : "");
+    data->orig_end = g_strdup(end_time ? end_time : "");
+    data->orig_dur = dur_min;
+    data->orig_proj = g_strdup(current_proj ? current_proj : "");
+    data->popover = pop;
+
+    GtkWidget *times_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    GtkWidget *start_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_hexpand(start_box, TRUE);
+    GtkWidget *start_lbl = make_label("Start Time", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(start_lbl), 0.0f);
+    data->start_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->start_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->start_entry), data->orig_start);
+    gtk_entry_set_max_length(GTK_ENTRY(data->start_entry), 5);
+    gtk_box_append(GTK_BOX(start_box), start_lbl);
+    gtk_box_append(GTK_BOX(start_box), data->start_entry);
+
+    GtkWidget *end_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_hexpand(end_box, TRUE);
+    GtkWidget *end_lbl = make_label("End Time", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(end_lbl), 0.0f);
+    data->end_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->end_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->end_entry), data->orig_end);
+    gtk_entry_set_max_length(GTK_ENTRY(data->end_entry), 5);
+    gtk_box_append(GTK_BOX(end_box), end_lbl);
+    gtk_box_append(GTK_BOX(end_box), data->end_entry);
+
+    gtk_box_append(GTK_BOX(times_row), start_box);
+    gtk_box_append(GTK_BOX(times_row), end_box);
+    gtk_box_append(GTK_BOX(content), times_row);
+
+    GtkWidget *dur_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *dur_lbl = make_label("Duration (min)", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(dur_lbl), 0.0f);
+    data->dur_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->dur_entry, "session-entry");
+    char dur_buf[16];
+    snprintf(dur_buf, sizeof(dur_buf), "%d", dur_min > 0 ? dur_min : 25);
+    gtk_editable_set_text(GTK_EDITABLE(data->dur_entry), dur_buf);
+    gtk_entry_set_max_length(GTK_ENTRY(data->dur_entry), 4);
+    gtk_box_append(GTK_BOX(dur_box), dur_lbl);
+    gtk_box_append(GTK_BOX(dur_box), data->dur_entry);
+    gtk_box_append(GTK_BOX(content), dur_box);
+
+    GtkWidget *proj_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *proj_lbl = make_label("Project", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(proj_lbl), 0.0f);
+    data->proj_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->proj_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->proj_entry), data->orig_proj);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(data->proj_entry), "Project (optional)...");
+    gtk_box_append(GTK_BOX(proj_box), proj_lbl);
+    gtk_box_append(GTK_BOX(proj_box), data->proj_entry);
+    gtk_box_append(GTK_BOX(content), proj_box);
+
+    if (cached_all_projects != NULL && strlen(cached_all_projects) > 0) {
+        char **projs = g_strsplit(cached_all_projects, "\n", -1);
+        GtkWidget *chip_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        int added = 0;
+        for (int i = 0; projs[i] != NULL && added < 4; i++) {
+            if (strlen(projs[i]) == 0) continue;
+            GtkWidget *chip = gtk_button_new_with_label(projs[i]);
+            gtk_widget_add_css_class(chip, "project-chip-btn");
+            if (current_proj != NULL && strcmp(current_proj, projs[i]) == 0) {
+                gtk_widget_add_css_class(chip, "selected");
+            }
+            g_signal_connect(chip, "clicked", G_CALLBACK(on_edit_project_chip_clicked), data);
+            gtk_box_append(GTK_BOX(chip_box), chip);
+            added++;
+        }
+        if (added > 0) {
+            gtk_box_append(GTK_BOX(content), chip_box);
+        }
+        g_strfreev(projs);
+    }
+
+    g_signal_connect(data->start_entry, "changed", G_CALLBACK(on_edit_session_time_changed), data);
+    g_signal_connect(data->end_entry, "changed", G_CALLBACK(on_edit_session_time_changed), data);
+    g_signal_connect(data->dur_entry, "changed", G_CALLBACK(on_edit_session_dur_changed), data);
+
+    g_signal_connect(data->start_entry, "activate", G_CALLBACK(edit_session_submit), data);
+    g_signal_connect(data->end_entry, "activate", G_CALLBACK(edit_session_submit), data);
+    g_signal_connect(data->dur_entry, "activate", G_CALLBACK(edit_session_submit), data);
+    g_signal_connect(data->proj_entry, "activate", G_CALLBACK(edit_session_submit), data);
+
+    GtkWidget *save_btn = gtk_button_new_with_label("Save Changes");
+    gtk_widget_add_css_class(save_btn, "primary-button");
+    gtk_widget_add_css_class(save_btn, "session-submit-btn");
+    gtk_widget_set_size_request(save_btn, -1, 30);
+    g_signal_connect(save_btn, "clicked", G_CALLBACK(edit_session_submit), data);
+    gtk_box_append(GTK_BOX(content), save_btn);
+
+    g_signal_connect(pop, "show", G_CALLBACK(on_edit_session_popover_show), data);
+    g_object_set_data_full(G_OBJECT(pop), "edit_session_data", data, free_edit_session_data);
+
+    gtk_popover_set_child(GTK_POPOVER(pop), content);
+    return pop;
+}
+
+typedef struct {
+    GtkWidget *popover;
+    GtkWidget *start_entry;
+    GtkWidget *end_entry;
+    GtkWidget *dur_entry;
+    GtkWidget *proj_entry;
+    gboolean is_updating;
+} AddSessionData;
+
+static void free_add_session_data(gpointer data) {
+    g_free(data);
+}
+
+static void on_add_session_time_changed(GtkEditable *editable, gpointer user_data) {
+    (void)editable;
+    AddSessionData *d = (AddSessionData *)user_data;
+    if (d == NULL || d->is_updating) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *et = gtk_editable_get_text(GTK_EDITABLE(d->end_entry));
+    if (st == NULL || et == NULL || strlen(st) < 4 || strlen(et) < 4) return;
+
+    int sh = 0, sm = 0, eh = 0, em = 0;
+    if (sscanf(st, "%d:%d", &sh, &sm) == 2 && sscanf(et, "%d:%d", &eh, &em) == 2) {
+        int diff = (eh * 60 + em) - (sh * 60 + sm);
+        if (diff < 0) diff += 24 * 60;
+        if (diff > 0 && diff <= 1440) {
+            d->is_updating = TRUE;
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", diff);
+            gtk_editable_set_text(GTK_EDITABLE(d->dur_entry), buf);
+            d->is_updating = FALSE;
+        }
+    }
+}
+
+static void on_add_session_dur_changed(GtkEditable *editable, gpointer user_data) {
+    (void)editable;
+    AddSessionData *d = (AddSessionData *)user_data;
+    if (d == NULL || d->is_updating) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *dt = gtk_editable_get_text(GTK_EDITABLE(d->dur_entry));
+    if (st == NULL || dt == NULL || strlen(st) < 4 || strlen(dt) == 0) return;
+
+    int sh = 0, sm = 0;
+    int dur = atoi(dt);
+    if (sscanf(st, "%d:%d", &sh, &sm) == 2 && dur > 0 && dur <= 1440) {
+        int total_m = (sh * 60 + sm + dur) % (24 * 60);
+        int eh = total_m / 60;
+        int em = total_m % 60;
+        d->is_updating = TRUE;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d", eh, em);
+        gtk_editable_set_text(GTK_EDITABLE(d->end_entry), buf);
+        d->is_updating = FALSE;
+    }
+}
+
+static void on_project_chip_clicked(GtkButton *btn, gpointer user_data) {
+    AddSessionData *d = (AddSessionData *)user_data;
+    const char *label = gtk_button_get_label(btn);
+    if (label != NULL && d != NULL && d->proj_entry != NULL) {
+        gtk_editable_set_text(GTK_EDITABLE(d->proj_entry), label);
+    }
+}
+
+static void add_session_submit(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    AddSessionData *d = (AddSessionData *)user_data;
+    if (d == NULL) return;
+
+    const char *st = gtk_editable_get_text(GTK_EDITABLE(d->start_entry));
+    const char *et = gtk_editable_get_text(GTK_EDITABLE(d->end_entry));
+    const char *dt = gtk_editable_get_text(GTK_EDITABLE(d->dur_entry));
+    const char *pt = gtk_editable_get_text(GTK_EDITABLE(d->proj_entry));
+
+    char start_buf[16] = "00:00";
+    char end_buf[16] = "00:00";
+    int dur = (dt != NULL) ? atoi(dt) : 0;
+
+    time_t now_t = time(NULL);
+    struct tm *tm_now = localtime(&now_t);
+
+    if (st != NULL && strlen(st) >= 3) {
+        strncpy(start_buf, st, sizeof(start_buf) - 1);
+    } else {
+        snprintf(start_buf, sizeof(start_buf), "%02d:%02d", tm_now->tm_hour, tm_now->tm_min);
+    }
+
+    if (et != NULL && strlen(et) >= 3) {
+        strncpy(end_buf, et, sizeof(end_buf) - 1);
+    } else {
+        snprintf(end_buf, sizeof(end_buf), "%02d:%02d", tm_now->tm_hour, tm_now->tm_min);
+    }
+
+    if (dur <= 0) {
+        int sh = 0, sm = 0, eh = 0, em = 0;
+        if (sscanf(start_buf, "%d:%d", &sh, &sm) == 2 && sscanf(end_buf, "%d:%d", &eh, &em) == 2) {
+            dur = (eh * 60 + em) - (sh * 60 + sm);
+            if (dur < 0) dur += 24 * 60;
+        }
+        if (dur <= 0) dur = 25;
+    }
+
+    char *cmd = NULL;
+    if (pt != NULL && strlen(pt) > 0) {
+        cmd = g_strdup_printf("add_session %s %s %d %s", start_buf, end_buf, dur, pt);
+    } else {
+        cmd = g_strdup_printf("add_session %s %s %d", start_buf, end_buf, dur);
+    }
+
+    if (is_dev_mode) {
+        goGTKDevAction(cmd);
+    } else {
+        goGTKCommand(cmd);
+    }
+    g_free(cmd);
+
+    if (d->popover != NULL) {
+        gtk_popover_popdown(GTK_POPOVER(d->popover));
+    }
+}
+
+static void on_add_session_popover_show(GtkWidget *popover, gpointer user_data) {
+    (void)popover;
+    AddSessionData *d = (AddSessionData *)user_data;
+    if (d == NULL) return;
+
+    time_t now_t = time(NULL);
+    struct tm *tm_now = localtime(&now_t);
+    char end_def[16];
+    snprintf(end_def, sizeof(end_def), "%02d:%02d", tm_now->tm_hour, tm_now->tm_min);
+
+    time_t start_t = now_t - 25 * 60;
+    struct tm *tm_start = localtime(&start_t);
+    char start_def[16];
+    snprintf(start_def, sizeof(start_def), "%02d:%02d", tm_start->tm_hour, tm_start->tm_min);
+
+    d->is_updating = TRUE;
+    gtk_editable_set_text(GTK_EDITABLE(d->start_entry), start_def);
+    gtk_editable_set_text(GTK_EDITABLE(d->end_entry), end_def);
+    gtk_editable_set_text(GTK_EDITABLE(d->dur_entry), "25");
+    gtk_editable_set_text(GTK_EDITABLE(d->proj_entry), "");
+    d->is_updating = FALSE;
+}
+
+static GtkWidget *create_add_session_popover(void) {
+    GtkWidget *pop = gtk_popover_new();
+    gtk_widget_add_css_class(pop, "session-popover");
+    gtk_popover_set_position(GTK_POPOVER(pop), GTK_POS_BOTTOM);
+
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_size_request(content, 220, -1);
+    gtk_widget_set_margin_start(content, 10);
+    gtk_widget_set_margin_end(content, 10);
+    gtk_widget_set_margin_top(content, 10);
+    gtk_widget_set_margin_bottom(content, 10);
+
+    GtkWidget *title = make_label("Add Manual Session", "project-popover-title");
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
+    gtk_box_append(GTK_BOX(content), title);
+
+    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_append(GTK_BOX(content), sep);
+
+    AddSessionData *data = g_new0(AddSessionData, 1);
+    data->popover = pop;
+
+    time_t now_t = time(NULL);
+    struct tm *tm_now = localtime(&now_t);
+    char end_def[16];
+    snprintf(end_def, sizeof(end_def), "%02d:%02d", tm_now->tm_hour, tm_now->tm_min);
+
+    time_t start_t = now_t - 25 * 60;
+    struct tm *tm_start = localtime(&start_t);
+    char start_def[16];
+    snprintf(start_def, sizeof(start_def), "%02d:%02d", tm_start->tm_hour, tm_start->tm_min);
+
+    GtkWidget *times_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    GtkWidget *start_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_hexpand(start_box, TRUE);
+    GtkWidget *start_lbl = make_label("Start Time", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(start_lbl), 0.0f);
+    data->start_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->start_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->start_entry), start_def);
+    gtk_entry_set_max_length(GTK_ENTRY(data->start_entry), 5);
+    gtk_box_append(GTK_BOX(start_box), start_lbl);
+    gtk_box_append(GTK_BOX(start_box), data->start_entry);
+
+    GtkWidget *end_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    gtk_widget_set_hexpand(end_box, TRUE);
+    GtkWidget *end_lbl = make_label("End Time", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(end_lbl), 0.0f);
+    data->end_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->end_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->end_entry), end_def);
+    gtk_entry_set_max_length(GTK_ENTRY(data->end_entry), 5);
+    gtk_box_append(GTK_BOX(end_box), end_lbl);
+    gtk_box_append(GTK_BOX(end_box), data->end_entry);
+
+    gtk_box_append(GTK_BOX(times_row), start_box);
+    gtk_box_append(GTK_BOX(times_row), end_box);
+    gtk_box_append(GTK_BOX(content), times_row);
+
+    GtkWidget *dur_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *dur_lbl = make_label("Duration (min)", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(dur_lbl), 0.0f);
+    data->dur_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->dur_entry, "session-entry");
+    gtk_editable_set_text(GTK_EDITABLE(data->dur_entry), "25");
+    gtk_entry_set_max_length(GTK_ENTRY(data->dur_entry), 4);
+    gtk_box_append(GTK_BOX(dur_box), dur_lbl);
+    gtk_box_append(GTK_BOX(dur_box), data->dur_entry);
+    gtk_box_append(GTK_BOX(content), dur_box);
+
+    GtkWidget *proj_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    GtkWidget *proj_lbl = make_label("Project", "setting-unit");
+    gtk_label_set_xalign(GTK_LABEL(proj_lbl), 0.0f);
+    data->proj_entry = gtk_entry_new();
+    gtk_widget_add_css_class(data->proj_entry, "session-entry");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(data->proj_entry), "Project (optional)...");
+    gtk_box_append(GTK_BOX(proj_box), proj_lbl);
+    gtk_box_append(GTK_BOX(proj_box), data->proj_entry);
+    gtk_box_append(GTK_BOX(content), proj_box);
+
+    if (cached_all_projects != NULL && strlen(cached_all_projects) > 0) {
+        char **projs = g_strsplit(cached_all_projects, "\n", -1);
+        GtkWidget *chip_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        int added = 0;
+        for (int i = 0; projs[i] != NULL && added < 4; i++) {
+            if (strlen(projs[i]) == 0) continue;
+            GtkWidget *chip = gtk_button_new_with_label(projs[i]);
+            gtk_widget_add_css_class(chip, "project-chip-btn");
+            g_signal_connect(chip, "clicked", G_CALLBACK(on_project_chip_clicked), data);
+            gtk_box_append(GTK_BOX(chip_box), chip);
+            added++;
+        }
+        if (added > 0) {
+            gtk_box_append(GTK_BOX(content), chip_box);
+        }
+        g_strfreev(projs);
+    }
+
+    g_signal_connect(data->start_entry, "changed", G_CALLBACK(on_add_session_time_changed), data);
+    g_signal_connect(data->end_entry, "changed", G_CALLBACK(on_add_session_time_changed), data);
+    g_signal_connect(data->dur_entry, "changed", G_CALLBACK(on_add_session_dur_changed), data);
+
+    g_signal_connect(data->start_entry, "activate", G_CALLBACK(add_session_submit), data);
+    g_signal_connect(data->end_entry, "activate", G_CALLBACK(add_session_submit), data);
+    g_signal_connect(data->dur_entry, "activate", G_CALLBACK(add_session_submit), data);
+    g_signal_connect(data->proj_entry, "activate", G_CALLBACK(add_session_submit), data);
+
+    GtkWidget *submit_btn = gtk_button_new_with_label("Add Session");
+    gtk_widget_add_css_class(submit_btn, "primary-button");
+    gtk_widget_add_css_class(submit_btn, "session-submit-btn");
+    gtk_widget_set_size_request(submit_btn, -1, 30);
+    g_signal_connect(submit_btn, "clicked", G_CALLBACK(add_session_submit), data);
+    gtk_box_append(GTK_BOX(content), submit_btn);
+
+    g_signal_connect(pop, "show", G_CALLBACK(on_add_session_popover_show), data);
+    g_object_set_data_full(G_OBJECT(pop), "add_session_data", data, free_add_session_data);
+
+    gtk_popover_set_child(GTK_POPOVER(pop), content);
+    return pop;
+}
+
 static void delete_block_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     char *cmd = (char *)user_data;
@@ -288,12 +834,16 @@ static gboolean apply_stats_update(gpointer data) {
                     const char *start = "";
                     const char *end = "";
                     const char *dur = "0m";
+                    const char *proj = "";
 
                     if (n_parts >= 4) {
                         block_idx = atoi(parts[0]);
                         start = parts[1];
                         end = parts[2];
                         dur = parts[3];
+                        if (n_parts >= 5 && strlen(parts[4]) > 0) {
+                            proj = parts[4];
+                        }
                     } else {
                         block_idx = i;
                         start = parts[0];
@@ -301,7 +851,20 @@ static gboolean apply_stats_update(gpointer data) {
                         dur = parts[2];
                     }
 
-                    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                    int dur_min = 0;
+                    if (n_parts >= 6 && strlen(parts[5]) > 0) {
+                        dur_min = atoi(parts[5]);
+                    }
+                    if (dur_min <= 0 && strlen(start) >= 4 && strlen(end) >= 4) {
+                        int sh = 0, sm = 0, eh = 0, em = 0;
+                        if (sscanf(start, "%d:%d", &sh, &sm) == 2 && sscanf(end, "%d:%d", &eh, &em) == 2) {
+                            dur_min = (eh * 60 + em) - (sh * 60 + sm);
+                            if (dur_min < 0) dur_min += 24 * 60;
+                        }
+                    }
+                    if (dur_min <= 0) dur_min = 25;
+
+                    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
                     gtk_widget_add_css_class(row, "timeline-row");
                     gtk_widget_set_valign(row, GTK_ALIGN_CENTER);
 
@@ -314,10 +877,42 @@ static gboolean apply_stats_update(gpointer data) {
                     gtk_widget_add_css_class(time_lbl, "timeline-time-range");
                     gtk_label_set_xalign(GTK_LABEL(time_lbl), 0.0f);
 
+                    gtk_box_append(GTK_BOX(row), dot);
+                    gtk_box_append(GTK_BOX(row), time_lbl);
+
+                    if (strlen(proj) > 0) {
+                        char short_proj[8];
+                        g_utf8_strncpy(short_proj, proj, 4);
+                        GtkWidget *p_badge = gtk_label_new(short_proj);
+                        gtk_widget_add_css_class(p_badge, "timeline-project-badge");
+                        gtk_widget_set_tooltip_text(p_badge, proj);
+                        gtk_box_append(GTK_BOX(row), p_badge);
+                    }
+
                     GtkWidget *dur_lbl = gtk_label_new(dur);
                     gtk_widget_add_css_class(dur_lbl, "timeline-dur");
                     gtk_widget_set_hexpand(dur_lbl, TRUE);
                     gtk_label_set_xalign(GTK_LABEL(dur_lbl), 1.0f);
+
+                    GtkWidget *edit_btn = gtk_menu_button_new();
+                    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(edit_btn), "document-edit-symbolic");
+                    gtk_widget_add_css_class(edit_btn, "flat");
+                    gtk_widget_add_css_class(edit_btn, "timeline-edit-btn");
+                    GtkWidget *edit_child = gtk_widget_get_first_child(edit_btn);
+                    if (edit_child != NULL) {
+                        gtk_widget_add_css_class(edit_child, "flat");
+                        gtk_widget_add_css_class(edit_child, "timeline-edit-btn");
+                    }
+                    GtkWidget *edit_img = gtk_button_get_child(GTK_BUTTON(edit_child && GTK_IS_BUTTON(edit_child) ? edit_child : edit_btn));
+                    if (edit_img != NULL && GTK_IS_IMAGE(edit_img)) {
+                        gtk_image_set_pixel_size(GTK_IMAGE(edit_img), 14);
+                    }
+                    gtk_widget_set_tooltip_text(edit_btn, "Edit session");
+                    gtk_widget_set_size_request(edit_btn, 24, 24);
+                    gtk_widget_set_valign(edit_btn, GTK_ALIGN_CENTER);
+
+                    GtkWidget *popover = create_edit_session_popover(block_idx, start, end, dur_min, proj);
+                    gtk_menu_button_set_popover(GTK_MENU_BUTTON(edit_btn), popover);
 
                     GtkWidget *del_btn = gtk_button_new_from_icon_name("user-trash-symbolic");
                     GtkWidget *btn_child = gtk_button_get_child(GTK_BUTTON(del_btn));
@@ -332,9 +927,8 @@ static gboolean apply_stats_update(gpointer data) {
                     char *cmd_str = g_strdup_printf("delete_block %d", block_idx);
                     g_signal_connect_data(del_btn, "clicked", G_CALLBACK(delete_block_clicked), cmd_str, (GClosureNotify)g_free, 0);
 
-                    gtk_box_append(GTK_BOX(row), dot);
-                    gtk_box_append(GTK_BOX(row), time_lbl);
                     gtk_box_append(GTK_BOX(row), dur_lbl);
+                    gtk_box_append(GTK_BOX(row), edit_btn);
                     gtk_box_append(GTK_BOX(row), del_btn);
 
                     gtk_box_append(GTK_BOX(stats_today_box), row);
@@ -432,6 +1026,303 @@ void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_da
     up->week_summary = g_strdup(week_summary);
     up->week_days = g_strdup(week_days_data);
     g_idle_add(apply_stats_update, up);
+}
+
+typedef struct {
+    char *all_projects;
+    char *project_summaries;
+    char *past_sessions;
+} ProjectsUpdate;
+
+static void on_project_filter_dropdown_changed(GObject *gobject, GParamSpec *pspec, gpointer user_data);
+
+static void on_project_card_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    char *target = (char *)user_data;
+    if (stats_proj_dropdown != NULL && target != NULL) {
+        GListModel *model = gtk_drop_down_get_model(GTK_DROP_DOWN(stats_proj_dropdown));
+        if (model != NULL) {
+            guint n = g_list_model_get_n_items(model);
+            for (guint i = 1; i < n; i++) {
+                GtkStringObject *strobj = GTK_STRING_OBJECT(g_list_model_get_item(model, i));
+                if (strobj != NULL) {
+                    const char *s = gtk_string_object_get_string(strobj);
+                    if (s != NULL && strcmp(s, target) == 0) {
+                        gtk_drop_down_set_selected(GTK_DROP_DOWN(stats_proj_dropdown), i);
+                        g_object_unref(strobj);
+                        break;
+                    }
+                    g_object_unref(strobj);
+                }
+            }
+        }
+    }
+}
+
+static void render_projects_view(void) {
+    if (stats_proj_box == NULL) return;
+
+    GtkWidget *c = gtk_widget_get_first_child(stats_proj_box);
+    while (c != NULL) {
+        GtkWidget *next = gtk_widget_get_next_sibling(c);
+        gtk_box_remove(GTK_BOX(stats_proj_box), c);
+        c = next;
+    }
+
+    guint sel = stats_proj_dropdown ? gtk_drop_down_get_selected(GTK_DROP_DOWN(stats_proj_dropdown)) : 0;
+
+    if (sel == 0) {
+        // "All Projects" view: aggregated summary per project
+        if (cached_project_summaries == NULL || strlen(cached_project_summaries) == 0) {
+            if (stats_proj_summary_lbl != NULL) {
+                gtk_label_set_text(GTK_LABEL(stats_proj_summary_lbl), "All Projects: 0m total");
+            }
+            GtkWidget *empty_lbl = gtk_label_new("No projects recorded yet");
+            gtk_widget_add_css_class(empty_lbl, "muted-label");
+            gtk_widget_set_margin_top(empty_lbl, 28);
+            gtk_box_append(GTK_BOX(stats_proj_box), empty_lbl);
+
+            GtkWidget *sub_lbl = gtk_label_new("Attach a project using the edit icon in Today!");
+            gtk_widget_add_css_class(sub_lbl, "muted-label");
+            gtk_widget_set_margin_top(sub_lbl, 4);
+            gtk_box_append(GTK_BOX(stats_proj_box), sub_lbl);
+            return;
+        }
+
+        char **lines = g_strsplit(cached_project_summaries, "\n", -1);
+        int total_m = 0;
+        int total_sessions = 0;
+        for (int i = 0; lines[i] != NULL; i++) {
+            if (strlen(lines[i]) == 0) continue;
+            char **p = g_strsplit(lines[i], "|", 4);
+            if (g_strv_length(p) >= 4) {
+                total_m += atoi(p[1]);
+                total_sessions += atoi(p[3]);
+            }
+            g_strfreev(p);
+        }
+
+        int th = total_m / 60;
+        int tm = total_m % 60;
+        char sum_buf[128];
+        if (th > 0 && tm > 0) {
+            snprintf(sum_buf, sizeof(sum_buf), "All Projects: %dh %02dm total (%d sessions)", th, tm, total_sessions);
+        } else if (th > 0) {
+            snprintf(sum_buf, sizeof(sum_buf), "All Projects: %dh total (%d sessions)", th, total_sessions);
+        } else {
+            snprintf(sum_buf, sizeof(sum_buf), "All Projects: %dm total (%d sessions)", tm, total_sessions);
+        }
+        if (stats_proj_summary_lbl != NULL) {
+            gtk_label_set_text(GTK_LABEL(stats_proj_summary_lbl), sum_buf);
+        }
+
+        for (int i = 0; lines[i] != NULL; i++) {
+            if (strlen(lines[i]) == 0) continue;
+            char **p = g_strsplit(lines[i], "|", 4);
+            if (g_strv_length(p) >= 4) {
+                const char *pname = p[0];
+                const char *ptimestr = p[2];
+                int pcount = atoi(p[3]);
+
+                GtkWidget *card = gtk_button_new();
+                gtk_widget_add_css_class(card, "project-summary-card");
+
+                GtkWidget *card_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                gtk_widget_set_valign(card_box, GTK_ALIGN_CENTER);
+
+                GtkWidget *dot = gtk_label_new("●");
+                gtk_widget_add_css_class(dot, "timeline-dot");
+
+                GtkWidget *name_lbl = gtk_label_new(pname);
+                gtk_widget_add_css_class(name_lbl, "project-card-name");
+                gtk_label_set_xalign(GTK_LABEL(name_lbl), 0.0f);
+
+                char cnt_buf[32];
+                snprintf(cnt_buf, sizeof(cnt_buf), "%d session%s", pcount, pcount == 1 ? "" : "s");
+                GtkWidget *cnt_lbl = gtk_label_new(cnt_buf);
+                gtk_widget_add_css_class(cnt_lbl, "project-card-count");
+
+                GtkWidget *time_lbl = gtk_label_new(ptimestr);
+                gtk_widget_add_css_class(time_lbl, "project-card-time");
+                gtk_widget_set_hexpand(time_lbl, TRUE);
+                gtk_label_set_xalign(GTK_LABEL(time_lbl), 1.0f);
+
+                gtk_box_append(GTK_BOX(card_box), dot);
+                gtk_box_append(GTK_BOX(card_box), name_lbl);
+                gtk_box_append(GTK_BOX(card_box), cnt_lbl);
+                gtk_box_append(GTK_BOX(card_box), time_lbl);
+                gtk_button_set_child(GTK_BUTTON(card), card_box);
+
+                char *proj_copy = g_strdup(pname);
+                g_signal_connect_data(card, "clicked", G_CALLBACK(on_project_card_clicked), proj_copy, (GClosureNotify)g_free, 0);
+
+                gtk_box_append(GTK_BOX(stats_proj_box), card);
+            }
+            g_strfreev(p);
+        }
+        g_strfreev(lines);
+    } else {
+        // Specific Project selected: filter past sessions for this project
+        GtkStringObject *strobj = GTK_STRING_OBJECT(gtk_drop_down_get_selected_item(GTK_DROP_DOWN(stats_proj_dropdown)));
+        const char *target_proj = strobj ? gtk_string_object_get_string(strobj) : "";
+
+        char *proj_timestr = g_strdup("0m");
+        int proj_count = 0;
+        if (cached_project_summaries != NULL) {
+            char **lines = g_strsplit(cached_project_summaries, "\n", -1);
+            for (int i = 0; lines[i] != NULL; i++) {
+                char **p = g_strsplit(lines[i], "|", 4);
+                if (g_strv_length(p) >= 4 && strcmp(p[0], target_proj) == 0) {
+                    g_free(proj_timestr);
+                    proj_timestr = g_strdup(p[2]);
+                    proj_count = atoi(p[3]);
+                    g_strfreev(p);
+                    break;
+                }
+                g_strfreev(p);
+            }
+            g_strfreev(lines);
+        }
+
+        char sum_buf[128];
+        snprintf(sum_buf, sizeof(sum_buf), "%s: %s (%d session%s)", target_proj, proj_timestr, proj_count, proj_count == 1 ? "" : "s");
+        g_free(proj_timestr);
+        if (stats_proj_summary_lbl != NULL) {
+            gtk_label_set_text(GTK_LABEL(stats_proj_summary_lbl), sum_buf);
+        }
+
+        int matching = 0;
+        if (cached_past_sessions != NULL && strlen(cached_past_sessions) > 0) {
+            char **lines = g_strsplit(cached_past_sessions, "\n", -1);
+            for (int i = 0; lines[i] != NULL; i++) {
+                if (strlen(lines[i]) == 0) continue;
+                char **p = g_strsplit(lines[i], "|", 5);
+                if (g_strv_length(p) >= 5 && strcmp(p[4], target_proj) == 0) {
+                    matching++;
+                    const char *date_str = p[0];
+                    const char *start_str = p[1];
+                    const char *end_str = p[2];
+                    const char *dur_str = p[3];
+
+                    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                    gtk_widget_add_css_class(row, "timeline-row");
+                    gtk_widget_set_valign(row, GTK_ALIGN_CENTER);
+
+                    GtkWidget *dot = gtk_label_new("●");
+                    gtk_widget_add_css_class(dot, "timeline-dot");
+
+                    char dt_buf[64];
+                    snprintf(dt_buf, sizeof(dt_buf), "%s  %s – %s", date_str, start_str, end_str);
+                    GtkWidget *time_lbl = gtk_label_new(dt_buf);
+                    gtk_widget_add_css_class(time_lbl, "timeline-time-range");
+                    gtk_label_set_xalign(GTK_LABEL(time_lbl), 0.0f);
+
+                    GtkWidget *dur_lbl = gtk_label_new(dur_str);
+                    gtk_widget_add_css_class(dur_lbl, "timeline-dur");
+                    gtk_widget_set_hexpand(dur_lbl, TRUE);
+                    gtk_label_set_xalign(GTK_LABEL(dur_lbl), 1.0f);
+
+                    gtk_box_append(GTK_BOX(row), dot);
+                    gtk_box_append(GTK_BOX(row), time_lbl);
+                    gtk_box_append(GTK_BOX(row), dur_lbl);
+
+                    gtk_box_append(GTK_BOX(stats_proj_box), row);
+                }
+                g_strfreev(p);
+            }
+            g_strfreev(lines);
+        }
+
+        if (matching == 0) {
+            GtkWidget *empty_lbl = gtk_label_new("No past sessions found for this project");
+            gtk_widget_add_css_class(empty_lbl, "muted-label");
+            gtk_widget_set_margin_top(empty_lbl, 28);
+            gtk_box_append(GTK_BOX(stats_proj_box), empty_lbl);
+        }
+    }
+}
+
+static void on_project_filter_dropdown_changed(GObject *gobject, GParamSpec *pspec, gpointer user_data) {
+    (void)gobject;
+    (void)pspec;
+    (void)user_data;
+    render_projects_view();
+}
+
+static gboolean apply_projects_update(gpointer data) {
+    ProjectsUpdate *up = (ProjectsUpdate *)data;
+    g_free(cached_all_projects);
+    cached_all_projects = up->all_projects;
+
+    g_free(cached_project_summaries);
+    cached_project_summaries = up->project_summaries;
+
+    g_free(cached_past_sessions);
+    cached_past_sessions = up->past_sessions;
+
+    if (stats_proj_dropdown != NULL) {
+        char *prev_selected = NULL;
+        guint cur_idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(stats_proj_dropdown));
+        if (cur_idx > 0) {
+            GtkStringObject *strobj = GTK_STRING_OBJECT(gtk_drop_down_get_selected_item(GTK_DROP_DOWN(stats_proj_dropdown)));
+            if (strobj != NULL) {
+                prev_selected = g_strdup(gtk_string_object_get_string(strobj));
+            }
+        }
+
+        GPtrArray *items = g_ptr_array_new();
+        g_ptr_array_add(items, g_strdup("All Projects"));
+        if (cached_all_projects != NULL && strlen(cached_all_projects) > 0) {
+            char **projs = g_strsplit(cached_all_projects, "\n", -1);
+            for (int i = 0; projs[i] != NULL; i++) {
+                if (strlen(projs[i]) > 0) {
+                    g_ptr_array_add(items, g_strdup(projs[i]));
+                }
+            }
+            g_strfreev(projs);
+        }
+        g_ptr_array_add(items, NULL);
+
+        guint restore_idx = 0;
+        if (prev_selected != NULL) {
+            for (guint i = 1; i < items->len - 1; i++) {
+                if (strcmp((char *)items->pdata[i], prev_selected) == 0) {
+                    restore_idx = i;
+                    break;
+                }
+            }
+            g_free(prev_selected);
+        }
+
+        GtkStringList *slist = gtk_string_list_new((const char *const *)items->pdata);
+        g_signal_handlers_block_by_func(stats_proj_dropdown, on_project_filter_dropdown_changed, NULL);
+        gtk_drop_down_set_model(GTK_DROP_DOWN(stats_proj_dropdown), G_LIST_MODEL(slist));
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(stats_proj_dropdown), restore_idx);
+        g_signal_handlers_unblock_by_func(stats_proj_dropdown, on_project_filter_dropdown_changed, NULL);
+
+        for (guint i = 0; i < items->len - 1; i++) {
+            g_free(items->pdata[i]);
+        }
+        g_ptr_array_free(items, TRUE);
+    }
+
+    render_projects_view();
+
+    g_free(up);
+    return G_SOURCE_REMOVE;
+}
+
+void pom_gtk_update_projects(const char *all_projects_data, const char *project_summaries_data,
+                            const char *past_sessions_data) {
+    if (active_update_projects_fn != NULL) {
+        active_update_projects_fn(all_projects_data, project_summaries_data, past_sessions_data);
+        return;
+    }
+    ProjectsUpdate *up = g_new0(ProjectsUpdate, 1);
+    up->all_projects = g_strdup(all_projects_data);
+    up->project_summaries = g_strdup(project_summaries_data);
+    up->past_sessions = g_strdup(past_sessions_data);
+    g_idle_add(apply_projects_update, up);
 }
 
 static GtkWidget *make_label(const char *text, const char *css_class) {
@@ -560,9 +1451,40 @@ static GtkWidget *build_stats_today_page(void) {
     gtk_widget_set_vexpand(box, TRUE);
     gtk_widget_set_hexpand(box, TRUE);
 
+    GtkWidget *header_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_hexpand(header_row, TRUE);
+    gtk_widget_set_margin_start(header_row, 4);
+    gtk_widget_set_margin_end(header_row, 4);
+    gtk_widget_set_valign(header_row, GTK_ALIGN_CENTER);
+
     stats_today_summary_lbl = make_label("0 sessions · 0m focus", "stats-sub-header");
-    gtk_widget_set_halign(stats_today_summary_lbl, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(box), stats_today_summary_lbl);
+    gtk_widget_set_hexpand(stats_today_summary_lbl, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(stats_today_summary_lbl), 0.0f);
+    gtk_widget_set_valign(stats_today_summary_lbl, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(header_row), stats_today_summary_lbl);
+
+    GtkWidget *add_session_btn = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(add_session_btn), "list-add-symbolic");
+    gtk_widget_add_css_class(add_session_btn, "flat");
+    gtk_widget_add_css_class(add_session_btn, "session-add-btn");
+    GtkWidget *btn_child = gtk_widget_get_first_child(add_session_btn);
+    if (btn_child != NULL) {
+        gtk_widget_add_css_class(btn_child, "flat");
+        gtk_widget_add_css_class(btn_child, "session-add-btn");
+    }
+    GtkWidget *btn_img = gtk_button_get_child(GTK_BUTTON(btn_child && GTK_IS_BUTTON(btn_child) ? btn_child : add_session_btn));
+    if (btn_img != NULL && GTK_IS_IMAGE(btn_img)) {
+        gtk_image_set_pixel_size(GTK_IMAGE(btn_img), 14);
+    }
+    gtk_widget_set_tooltip_text(add_session_btn, "Add session manually");
+    gtk_widget_set_size_request(add_session_btn, 24, 24);
+    gtk_widget_set_valign(add_session_btn, GTK_ALIGN_CENTER);
+
+    GtkWidget *popover = create_add_session_popover();
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(add_session_btn), popover);
+
+    gtk_box_append(GTK_BOX(header_row), add_session_btn);
+    gtk_box_append(GTK_BOX(box), header_row);
 
     GtkWidget *scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
@@ -605,7 +1527,47 @@ static GtkWidget *build_stats_week_page(void) {
     return box;
 }
 
-/* Builds Tab 2: Statistics Page with Today and Weekly sub-tabs */
+static GtkWidget *build_stats_projects_page(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_vexpand(box, TRUE);
+    gtk_widget_set_hexpand(box, TRUE);
+
+    GtkWidget *filter_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(filter_box, GTK_ALIGN_CENTER);
+
+    GtkWidget *filter_lbl = make_label("Project:", "stats-sub-header");
+    gtk_box_append(GTK_BOX(filter_box), filter_lbl);
+
+    const char *const init_items[] = {"All Projects", NULL};
+    stats_proj_dropdown = gtk_drop_down_new_from_strings(init_items);
+    gtk_widget_add_css_class(stats_proj_dropdown, "project-filter-dropdown");
+    g_signal_connect(stats_proj_dropdown, "notify::selected", G_CALLBACK(on_project_filter_dropdown_changed), NULL);
+    gtk_box_append(GTK_BOX(filter_box), stats_proj_dropdown);
+
+    gtk_box_append(GTK_BOX(box), filter_box);
+
+    stats_proj_summary_lbl = make_label("All Projects: 0m total", "stats-sub-header");
+    gtk_widget_set_halign(stats_proj_summary_lbl, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(box), stats_proj_summary_lbl);
+
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+    gtk_widget_set_hexpand(scroll, TRUE);
+    gtk_widget_set_size_request(scroll, -1, 185);
+
+    stats_proj_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_vexpand(stats_proj_box, TRUE);
+    gtk_widget_set_hexpand(stats_proj_box, TRUE);
+    gtk_widget_add_css_class(stats_proj_box, "timeline-box");
+
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), stats_proj_box);
+    gtk_box_append(GTK_BOX(box), scroll);
+
+    return box;
+}
+
+/* Builds Tab 2: Statistics Page with Today, Weekly, and Projects sub-tabs */
 static GtkWidget *build_stats_page(void) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_widget_set_vexpand(box, TRUE);
@@ -620,6 +1582,7 @@ static GtkWidget *build_stats_page(void) {
 
     GtkWidget *today_page = build_stats_today_page();
     GtkWidget *week_page = build_stats_week_page();
+    GtkWidget *projects_page = build_stats_projects_page();
 
     GtkStackPage *p_today = gtk_stack_add_child(GTK_STACK(stats_sub_stack), today_page);
     gtk_stack_page_set_name(p_today, "today");
@@ -628,6 +1591,10 @@ static GtkWidget *build_stats_page(void) {
     GtkStackPage *p_week = gtk_stack_add_child(GTK_STACK(stats_sub_stack), week_page);
     gtk_stack_page_set_name(p_week, "week");
     gtk_stack_page_set_title(p_week, "Weekly");
+
+    GtkStackPage *p_proj = gtk_stack_add_child(GTK_STACK(stats_sub_stack), projects_page);
+    gtk_stack_page_set_name(p_proj, "projects");
+    gtk_stack_page_set_title(p_proj, "Projects");
 
     GtkWidget *sub_switcher = gtk_stack_switcher_new();
     gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(sub_switcher), GTK_STACK(stats_sub_stack));
@@ -743,14 +1710,15 @@ static void on_duration_entry_activate(GtkEntry *entry, gpointer user_data) {
 
 static GtkWidget *build_duration_setting_block(const char *title, int initial_val, int setting_type, const char *unit_str) {
     GtkWidget *block = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_widget_set_halign(block, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(block, GTK_ALIGN_START);
 
     GtkWidget *t_lbl = make_label(title, "setting-title");
-    gtk_widget_set_halign(t_lbl, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(t_lbl, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(t_lbl), 0.0f);
     gtk_box_append(GTK_BOX(block), t_lbl);
 
     GtkWidget *input_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_halign(input_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign(input_box, GTK_ALIGN_START);
     gtk_widget_set_valign(input_box, GTK_ALIGN_CENTER);
 
     GtkWidget *entry = gtk_entry_new();
@@ -783,6 +1751,8 @@ static GtkWidget *build_duration_setting_block(const char *title, int initial_va
     gtk_widget_add_controller(entry, GTK_EVENT_CONTROLLER(click_gesture));
 
     GtkWidget *unit_lbl = make_label(unit_str != NULL ? unit_str : "min", "setting-unit");
+    gtk_widget_set_halign(unit_lbl, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(unit_lbl), 0.0f);
 
     gtk_box_append(GTK_BOX(input_box), entry);
     gtk_box_append(GTK_BOX(input_box), unit_lbl);
@@ -837,33 +1807,30 @@ static GtkWidget *build_settings_page(void) {
     gtk_widget_set_margin_top(box, 10);
 
     GtkWidget *title = make_label("Timer Settings", "stats-title");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0f);
     gtk_box_append(GTK_BOX(box), title);
 
     gtk_box_append(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     // 2x2 Layout for setting blocks
-    GtkWidget *row1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
-    gtk_widget_set_halign(row1, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_top(row1, 8);
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 32);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 14);
+    gtk_widget_set_halign(grid, GTK_ALIGN_START);
+    gtk_widget_set_margin_top(grid, 8);
 
     GtkWidget *work_block = build_duration_setting_block("Focus Duration", work_duration_val, 0, "min");
     GtkWidget *break_block = build_duration_setting_block("Short Break", break_duration_val, 1, "min");
-
-    gtk_box_append(GTK_BOX(row1), work_block);
-    gtk_box_append(GTK_BOX(row1), break_block);
-
-    GtkWidget *row2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
-    gtk_widget_set_halign(row2, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_top(row2, 12);
-
     GtkWidget *long_break_block = build_duration_setting_block("Long Break", long_break_duration_val, 2, "min");
     GtkWidget *cycles_block = build_duration_setting_block("Circles per Set", total_cycles_val, 3, "circles");
 
-    gtk_box_append(GTK_BOX(row2), long_break_block);
-    gtk_box_append(GTK_BOX(row2), cycles_block);
+    gtk_grid_attach(GTK_GRID(grid), work_block, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), break_block, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), long_break_block, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), cycles_block, 1, 1, 1, 1);
 
-    gtk_box_append(GTK_BOX(box), row1);
-    gtk_box_append(GTK_BOX(box), row2);
+    gtk_box_append(GTK_BOX(box), grid);
 
     return box;
 }
@@ -986,7 +1953,7 @@ static void switch_tab(int forward) {
 static void cycle_stats_sub_tab(int forward) {
     if (stats_sub_stack == NULL) return;
     const char *current = gtk_stack_get_visible_child_name(GTK_STACK(stats_sub_stack));
-    static const char *sub_tabs[] = {"today", "week"};
+    static const char *sub_tabs[] = {"today", "week", "projects"};
     int count = sizeof(sub_tabs) / sizeof(sub_tabs[0]);
     int idx = 0;
     if (current != NULL) {
@@ -1269,6 +2236,7 @@ void pom_gtk_reload_css(void) {
         ".mode-label.break-mode { color: #89b4fa; }"
         ".timer-label { font-family: monospace; font-size: 40px; font-weight: bold; color: #cdd6f4; }"
         ".muted-label { color: #9399b2; font-size: 12px; }"
+        ".stats-title { font-size: 14px; font-weight: bold; color: #b4befe; }"
         ".stats-sub-switcher { background: #181825; border-radius: 8px; padding: 2px; }"
         ".stats-sub-switcher button { border: none; border-radius: 6px; padding: 2px 14px; min-height: 22px; min-width: 56px; background: transparent; color: #a6adc8; font-size: 11px; font-weight: bold; outline: none; box-shadow: none; }"
         ".stats-sub-switcher button:checked { background: #313244; color: #b4befe; }"
@@ -1279,10 +2247,34 @@ void pom_gtk_reload_css(void) {
         ".timeline-row:hover { background: #232334; }"
         ".timeline-dot { color: #b4befe; font-size: 9px; margin-right: 2px; }"
         ".timeline-time-range { font-family: monospace; font-size: 12px; font-weight: bold; color: #cdd6f4; }"
-        ".timeline-dur { font-size: 11px; font-weight: 500; color: #a6adc8; }"
+        "menubutton.timeline-edit-btn, menubutton.timeline-edit-btn > button, menubutton.timeline-edit-btn button, button.timeline-edit-btn { border: none; border-radius: 6px; min-width: 24px; min-height: 24px; padding: 0; background: transparent; background-color: transparent; color: #6c7086; outline: none; box-shadow: none; }"
+        "menubutton.timeline-edit-btn:focus, menubutton.timeline-edit-btn > button:focus, menubutton.timeline-edit-btn button:focus { outline: none; box-shadow: none; border: none; }"
+        "menubutton.timeline-edit-btn image, menubutton.timeline-edit-btn button image, button.timeline-edit-btn image { -gtk-icon-size: 14px; }"
+        "menubutton.timeline-edit-btn:hover, menubutton.timeline-edit-btn > button:hover, menubutton.timeline-edit-btn button:hover, button.timeline-edit-btn:hover { background: rgba(180, 190, 254, 0.18); background-color: rgba(180, 190, 254, 0.18); color: #b4befe; }"
+        "menubutton.timeline-edit-btn:checked, menubutton.timeline-edit-btn > button:checked, menubutton.timeline-edit-btn button:checked { background: rgba(180, 190, 254, 0.25); background-color: rgba(180, 190, 254, 0.25); color: #b4befe; }"
         "button.timeline-delete-btn { border: none; border-radius: 6px; min-width: 24px; min-height: 24px; padding: 0; background: transparent; color: #6c7086; outline: none; box-shadow: none; }"
         "button.timeline-delete-btn image { -gtk-icon-size: 14px; }"
         "button.timeline-delete-btn:hover { background: rgba(243, 139, 168, 0.18); color: #f38ba8; }"
+        "popover.project-popover { background: #181825; border: 1px solid #45475a; border-radius: 10px; padding: 8px; }"
+        "popover.project-popover contents { background: #181825; padding: 6px; }"
+        ".project-popover-title { font-size: 11px; font-weight: bold; color: #a6adc8; margin-bottom: 2px; }"
+        "button.project-item-btn { border: none; border-radius: 6px; background: transparent; color: #cdd6f4; font-size: 12px; font-weight: 500; padding: 4px 8px; outline: none; box-shadow: none; }"
+        "button.project-item-btn:hover { background: #313244; color: #b4befe; }"
+        "button.project-clear-btn { border: none; border-radius: 6px; background: transparent; color: #6c7086; font-size: 11px; padding: 3px 8px; outline: none; box-shadow: none; }"
+        "button.project-clear-btn:hover { background: rgba(243, 139, 168, 0.15); color: #f38ba8; }"
+        "entry.project-new-entry { background: #11111b; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; font-size: 11px; min-height: 24px; padding: 2px 6px; box-shadow: none; outline: none; }"
+        "entry.project-new-entry:focus-within { border-color: #b4befe; }"
+        "entry.project-new-entry text { color: #cdd6f4; background: transparent; min-width: 0; min-height: 0; padding: 0; }"
+        "button.project-add-btn { border: none; border-radius: 6px; min-width: 24px; min-height: 24px; padding: 0; background: #313244; color: #b4befe; outline: none; box-shadow: none; }"
+        "button.project-add-btn image { -gtk-icon-size: 12px; }"
+        "button.project-add-btn:hover { background: #45475a; color: #cdd6f4; }"
+        "dropdown.project-filter-dropdown, .project-filter-dropdown button { background: #181825; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; font-size: 11px; font-weight: bold; min-height: 24px; padding: 2px 8px; }"
+        "dropdown.project-filter-dropdown:hover, .project-filter-dropdown button:hover { border-color: #45475a; color: #b4befe; }"
+        ".project-summary-card { background: #181825; border-radius: 8px; padding: 8px 12px; margin-bottom: 4px; min-height: 32px; border: 1px solid transparent; }"
+        ".project-summary-card:hover { background: #232334; border-color: #313244; }"
+        ".project-card-name { font-size: 12px; font-weight: bold; color: #cba6f7; }"
+        ".project-card-time { font-family: monospace; font-size: 12px; font-weight: bold; color: #a6e3a1; }"
+        ".project-card-count { font-size: 10px; font-weight: 500; color: #6c7086; }"
         ".week-row { padding: 3px 6px; border-radius: 6px; min-height: 22px; }"
         ".week-row.is-today { background: rgba(180, 190, 254, 0.08); }"
         ".week-day { font-size: 11px; font-weight: bold; color: #a6adc8; }"
@@ -1308,6 +2300,18 @@ void pom_gtk_reload_css(void) {
         "entry.setting-entry selection, entry.setting-entry selection:focus, entry.setting-entry text selection, entry.setting-entry text selection:focus { background-color: transparent; color: #cdd6f4; }"
         "entry.setting-entry text { color: #cdd6f4; background: transparent; min-width: 0; min-height: 0; padding: 0; }"
         ".setting-unit { color: #a6adc8; font-size: 12px; font-weight: 500; }"
+        "button.session-add-btn { border: none; border-radius: 6px; min-width: 24px; min-height: 24px; padding: 0; background: #313244; color: #b4befe; outline: none; box-shadow: none; }"
+        "button.session-add-btn:hover { background: #45475a; color: #cdd6f4; }"
+        "button.session-add-btn image { -gtk-icon-size: 14px; }"
+        "popover.session-popover { background: #181825; border: 1px solid #45475a; border-radius: 10px; padding: 8px; }"
+        "popover.session-popover contents { background: #181825; padding: 6px; }"
+        "entry.session-entry { background: #11111b; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px; font-size: 12px; min-height: 26px; padding: 2px 6px; box-shadow: none; outline: none; }"
+        "entry.session-entry:focus-within { border-color: #b4befe; }"
+        "entry.session-entry text { color: #cdd6f4; background: transparent; min-width: 0; min-height: 0; padding: 0; }"
+        "button.session-submit-btn { border: none; border-radius: 6px; background: #b4befe; color: #11111b; font-size: 12px; font-weight: bold; min-height: 28px; padding: 4px 10px; }"
+        "button.session-submit-btn:hover { background: #cdd6f4; color: #11111b; }"
+        "button.project-chip-btn { border: 1px solid #313244; border-radius: 10px; background: #181825; color: #a6adc8; font-size: 10px; font-weight: 500; padding: 2px 6px; min-height: 18px; outline: none; box-shadow: none; }"
+        "button.project-chip-btn:hover { background: #313244; color: #b4befe; border-color: #45475a; }"
         ".tab-switcher { background: transparent; border: none; padding: 0; }"
         ".tab-switcher button { border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 4px 12px; min-height: 28px; min-width: 38px; background: transparent; color: #6c7086; outline: none; box-shadow: none; }"
         ".tab-switcher button:hover { color: #a6adc8; }"
@@ -1410,6 +2414,7 @@ static gboolean apply_module_reload_idle(gpointer data) {
 
     active_update_fn = (DevUpdateFn)dlsym(h, "pom_gtk_update");
     active_update_stats_fn = (DevUpdateStatsFn)dlsym(h, "pom_gtk_update_stats");
+    active_update_projects_fn = (DevUpdateProjectsFn)dlsym(h, "pom_gtk_update_projects");
     active_key_dev_fn = (DevKeyFn)dlsym(h, "key_pressed_dev");
 
     current_dev_module_handle = h;
@@ -1432,8 +2437,11 @@ static gboolean quit_application(gpointer data) {
     stats_sub_stack = NULL;
     stats_today_box = NULL;
     stats_week_box = NULL;
+    stats_proj_box = NULL;
     stats_today_summary_lbl = NULL;
     stats_week_summary_lbl = NULL;
+    stats_proj_summary_lbl = NULL;
+    stats_proj_dropdown = NULL;
     return G_SOURCE_REMOVE;
 }
 
@@ -1447,8 +2455,11 @@ int pom_gtk_run(void) {
     stats_sub_stack = NULL;
     stats_today_box = NULL;
     stats_week_box = NULL;
+    stats_proj_box = NULL;
     stats_today_summary_lbl = NULL;
     stats_week_summary_lbl = NULL;
+    stats_proj_summary_lbl = NULL;
+    stats_proj_dropdown = NULL;
     application = gtk_application_new("io.github.waybarpomodoro.gtk", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "startup", G_CALLBACK(on_startup), NULL);
     g_signal_connect(application, "activate", G_CALLBACK(activate), NULL);
@@ -1459,8 +2470,11 @@ int pom_gtk_run(void) {
     stats_sub_stack = NULL;
     stats_today_box = NULL;
     stats_week_box = NULL;
+    stats_proj_box = NULL;
     stats_today_summary_lbl = NULL;
     stats_week_summary_lbl = NULL;
+    stats_proj_summary_lbl = NULL;
+    stats_proj_dropdown = NULL;
     return status;
 }
 
@@ -1470,8 +2484,11 @@ int pom_gtk_dev_run(void) {
     stats_sub_stack = NULL;
     stats_today_box = NULL;
     stats_week_box = NULL;
+    stats_proj_box = NULL;
     stats_today_summary_lbl = NULL;
     stats_week_summary_lbl = NULL;
+    stats_proj_summary_lbl = NULL;
+    stats_proj_dropdown = NULL;
     g_log_set_writer_func(dev_log_writer, NULL, NULL);
     application = gtk_application_new("io.github.waybarpomodoro.gtkdev", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(application, "startup", G_CALLBACK(on_startup), NULL);

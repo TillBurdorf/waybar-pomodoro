@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,9 +29,10 @@ import (
 )
 
 type devState struct {
-	mu      sync.Mutex
-	output  waybar.Output
-	summary stats.StatsSummary
+	mu               sync.Mutex
+	output           waybar.Output
+	summary          stats.StatsSummary
+	sessionStartTime time.Time
 }
 
 func getDevMockSummary() stats.StatsSummary {
@@ -63,14 +65,26 @@ func getDevMockSummary() stats.StatsSummary {
 		TodayCount:   2,
 		TodayMinutes: 60,
 		RecentHistory: []stats.SessionRecord{
-			{Timestamp: now.Add(-1 * time.Hour), Mode: "work", Duration: 1800},
+			{Timestamp: now.Add(-1 * time.Hour), Mode: "work", Duration: 1800, Project: "Frontend"},
 		},
 		TodayBlocks: []stats.WorkBlock{
-			{Index: 0, StartTime: "10:00", EndTime: "10:30", Duration: 30},
-			{Index: 1, StartTime: "17:00", EndTime: "17:30", Duration: 30},
+			{Index: 0, StartTime: "10:00", EndTime: "10:30", Duration: 30, Project: "Frontend"},
+			{Index: 1, StartTime: "17:00", EndTime: "17:30", Duration: 30, Project: ""},
 		},
 		WeekDays:     weekDays,
 		WeekTotalMin: totalMin,
+		AllProjects:  []string{"Frontend", "Backend", "Docs"},
+		ProjectSummaries: []stats.ProjectSummary{
+			{Name: "Frontend", Minutes: 120, TimeStr: stats.FormatDuration(120), SessionCount: 4},
+			{Name: "Backend", Minutes: 90, TimeStr: stats.FormatDuration(90), SessionCount: 3},
+			{Name: "Docs", Minutes: 45, TimeStr: stats.FormatDuration(45), SessionCount: 1},
+		},
+		PastSessions: []stats.PastSession{
+			{DateStr: "Today", StartTime: "10:00", EndTime: "10:30", Duration: 30, Project: "Frontend"},
+			{DateStr: "Yesterday", StartTime: "14:00", EndTime: "14:45", Duration: 45, Project: "Backend"},
+			{DateStr: "Yesterday", StartTime: "15:00", EndTime: "15:45", Duration: 45, Project: "Backend"},
+			{DateStr: "Yesterday", StartTime: "16:00", EndTime: "16:45", Duration: 45, Project: "Docs"},
+		},
 	}
 }
 
@@ -97,15 +111,60 @@ func (s *devState) handleAction(action string) {
 	switch action {
 	case "toggle":
 		s.output.Running = !s.output.Running
+		if s.output.Running && s.output.Mode == "work" && s.sessionStartTime.IsZero() {
+			s.sessionStartTime = time.Now()
+		}
 	case "skip":
 		if s.output.Mode == "work" {
-			s.output.Mode = "break"
-			s.output.Total = 5 * 60
-			s.output.Remaining = 5 * 60
+			elapsed := s.output.Total - s.output.Remaining
+			if elapsed < 0 {
+				elapsed = 0
+			} else if elapsed > s.output.Total {
+				elapsed = s.output.Total
+			}
+
+			if elapsed > 0 {
+				mins := elapsed / 60
+				if mins <= 0 {
+					mins = 1
+				}
+				s.summary.TodayCount++
+				s.summary.TodayMinutes += mins
+
+				now := time.Now().Local()
+				startTime := s.sessionStartTime
+				if startTime.IsZero() {
+					startTime = now.Add(-time.Duration(elapsed) * time.Second)
+				}
+				s.summary.TodayBlocks = append(s.summary.TodayBlocks, stats.WorkBlock{
+					Index:     len(s.summary.TodayBlocks),
+					StartTime: startTime.Format("15:04"),
+					EndTime:   now.Format("15:04"),
+					Duration:  mins,
+				})
+			}
+			s.sessionStartTime = time.Time{}
+
+			cfg := config.Load()
+			tc := cfg.TotalCycles
+			if tc <= 0 {
+				tc = 4
+			}
+			if s.summary.TodayCount > 0 && s.summary.TodayCount%tc == 0 {
+				s.output.Mode = "long_break"
+				s.output.Total = cfg.LongBreakDurationMinutes * 60
+				s.output.Remaining = cfg.LongBreakDurationMinutes * 60
+			} else {
+				s.output.Mode = "break"
+				s.output.Total = cfg.BreakDurationMinutes * 60
+				s.output.Remaining = cfg.BreakDurationMinutes * 60
+			}
 		} else {
+			cfg := config.Load()
 			s.output.Mode = "work"
-			s.output.Total = 25 * 60
-			s.output.Remaining = 25 * 60
+			s.output.Total = cfg.WorkDurationMinutes * 60
+			s.output.Remaining = cfg.WorkDurationMinutes * 60
+			s.sessionStartTime = time.Time{}
 		}
 		s.output.Running = false
 	case "reset":
@@ -115,11 +174,13 @@ func (s *devState) handleAction(action string) {
 			s.output.Remaining = 25 * 60
 		}
 		s.output.Running = false
+		s.sessionStartTime = time.Time{}
 	case "stop":
 		s.output.Mode = "work"
 		s.output.Total = 25 * 60
 		s.output.Remaining = 25 * 60
 		s.output.Running = false
+		s.sessionStartTime = time.Time{}
 	case "mode":
 		if s.output.Mode == "work" {
 			s.output.Mode = "break"
@@ -172,6 +233,145 @@ func (s *devState) handleAction(action string) {
 				s.summary.TodayMinutes -= block.Duration
 				if s.summary.TodayMinutes < 0 {
 					s.summary.TodayMinutes = 0
+				}
+			}
+		}
+	}
+
+	if strings.HasPrefix(action, "set_block_project ") {
+		parts := strings.SplitN(strings.TrimPrefix(action, "set_block_project "), " ", 2)
+		if len(parts) >= 1 {
+			var idx int
+			if _, err := fmt.Sscanf(parts[0], "%d", &idx); err == nil && idx >= 0 && idx < len(s.summary.TodayBlocks) {
+				proj := ""
+				if len(parts) == 2 {
+					proj = strings.TrimSpace(parts[1])
+				}
+				s.summary.TodayBlocks[idx].Project = proj
+				if proj != "" {
+					found := false
+					for _, p := range s.summary.AllProjects {
+						if p == proj {
+							found = true
+							break
+						}
+					}
+					if !found {
+						s.summary.AllProjects = append(s.summary.AllProjects, proj)
+					}
+				}
+			}
+		}
+	}
+
+	if strings.HasPrefix(action, "add_session ") {
+		parts := strings.Split(strings.TrimPrefix(action, "add_session "), " ")
+		if len(parts) >= 3 {
+			start := strings.TrimSpace(parts[0])
+			end := strings.TrimSpace(parts[1])
+			dur, _ := strconv.Atoi(parts[2])
+			proj := ""
+			if len(parts) >= 4 {
+				proj = strings.TrimSpace(strings.Join(parts[3:], " "))
+			}
+			if proj == "-" {
+				proj = ""
+			}
+			if dur <= 0 {
+				dur = 25
+			}
+			s.summary.TodayCount++
+			s.summary.TodayMinutes += dur
+			s.summary.TodayBlocks = append(s.summary.TodayBlocks, stats.WorkBlock{
+				Index:     len(s.summary.TodayBlocks),
+				StartTime: start,
+				EndTime:   end,
+				Duration:  dur,
+				Project:   proj,
+			})
+			if proj != "" {
+				found := false
+				for _, p := range s.summary.AllProjects {
+					if p == proj {
+						found = true
+						break
+					}
+				}
+				if !found {
+					s.summary.AllProjects = append(s.summary.AllProjects, proj)
+					sort.Strings(s.summary.AllProjects)
+				}
+				foundSum := false
+				for i := range s.summary.ProjectSummaries {
+					if s.summary.ProjectSummaries[i].Name == proj {
+						s.summary.ProjectSummaries[i].Minutes += dur
+						s.summary.ProjectSummaries[i].TimeStr = stats.FormatDuration(s.summary.ProjectSummaries[i].Minutes)
+						s.summary.ProjectSummaries[i].SessionCount++
+						foundSum = true
+						break
+					}
+				}
+				if !foundSum {
+					s.summary.ProjectSummaries = append(s.summary.ProjectSummaries, stats.ProjectSummary{
+						Name:         proj,
+						Minutes:      dur,
+						TimeStr:      stats.FormatDuration(dur),
+						SessionCount: 1,
+					})
+				}
+			}
+			now := time.Now().Local()
+			s.summary.PastSessions = append([]stats.PastSession{
+				{
+					DateStr:   now.Format("02 Jan"),
+					StartTime: start,
+					EndTime:   end,
+					Duration:  dur,
+					Project:   proj,
+				},
+			}, s.summary.PastSessions...)
+		}
+	}
+
+	if strings.HasPrefix(action, "edit_block ") {
+		parts := strings.Split(strings.TrimPrefix(action, "edit_block "), " ")
+		if len(parts) >= 4 {
+			idx, err := strconv.Atoi(parts[0])
+			start := strings.TrimSpace(parts[1])
+			end := strings.TrimSpace(parts[2])
+			dur, _ := strconv.Atoi(parts[3])
+			proj := ""
+			if len(parts) >= 5 {
+				proj = strings.TrimSpace(strings.Join(parts[4:], " "))
+			}
+			if proj == "-" {
+				proj = ""
+			}
+			if dur <= 0 {
+				dur = 25
+			}
+			if err == nil && idx >= 0 && idx < len(s.summary.TodayBlocks) {
+				oldDur := s.summary.TodayBlocks[idx].Duration
+				s.summary.TodayMinutes = s.summary.TodayMinutes - oldDur + dur
+				if s.summary.TodayMinutes < 0 {
+					s.summary.TodayMinutes = 0
+				}
+				s.summary.TodayBlocks[idx].StartTime = start
+				s.summary.TodayBlocks[idx].EndTime = end
+				s.summary.TodayBlocks[idx].Duration = dur
+				s.summary.TodayBlocks[idx].Project = proj
+				if proj != "" {
+					found := false
+					for _, p := range s.summary.AllProjects {
+						if p == proj {
+							found = true
+							break
+						}
+					}
+					if !found {
+						s.summary.AllProjects = append(s.summary.AllProjects, proj)
+						sort.Strings(s.summary.AllProjects)
+					}
 				}
 			}
 		}
@@ -285,12 +485,28 @@ func RunDevUI() error {
 			case <-ticker.C:
 				currentDevState.mu.Lock()
 				if currentDevState.output.Running {
+					if currentDevState.output.Mode == "work" && currentDevState.sessionStartTime.IsZero() {
+						currentDevState.sessionStartTime = time.Now()
+					}
 					if currentDevState.output.Remaining > 0 {
 						currentDevState.output.Remaining--
 					} else {
 						if currentDevState.output.Mode == "work" {
 							currentDevState.summary.TodayCount++
 							currentDevState.summary.TodayMinutes += 25
+							now := time.Now().Local()
+							start := currentDevState.sessionStartTime
+							if start.IsZero() {
+								start = now.Add(-25 * time.Minute)
+							}
+							currentDevState.summary.TodayBlocks = append(currentDevState.summary.TodayBlocks, stats.WorkBlock{
+								Index:     len(currentDevState.summary.TodayBlocks),
+								StartTime: start.Format("15:04"),
+								EndTime:   now.Format("15:04"),
+								Duration:  25,
+							})
+							currentDevState.sessionStartTime = time.Time{}
+
 							cfg := config.Load()
 							tc := cfg.TotalCycles
 							if tc <= 0 {
@@ -312,6 +528,7 @@ func RunDevUI() error {
 							currentDevState.output.Total = cfg.WorkDurationMinutes * 60
 							currentDevState.output.Remaining = cfg.WorkDurationMinutes * 60
 							currentDevState.output.Running = true
+							currentDevState.sessionStartTime = time.Now()
 						}
 					}
 					out := currentDevState.output

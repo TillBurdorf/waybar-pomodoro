@@ -9,6 +9,8 @@ void pom_gtk_update(const char *mode, const char *timer, const char *status,
                     const char *stats, const char *history, double fraction);
 void pom_gtk_update_stats(const char *today_summary, const char *today_blocks_data,
                           const char *week_summary, const char *week_days_data);
+void pom_gtk_update_projects(const char *all_projects_data, const char *project_summaries_data,
+                            const char *past_sessions_data);
 void pom_gtk_quit_async(void);
 void pom_gtk_set_initial_durations(int work_min, int break_min);
 void pom_gtk_set_initial_settings(int work_min, int break_min, int long_break_min, int total_cycles);

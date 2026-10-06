@@ -122,7 +122,7 @@ You can style the module based on its status classes:
 | `waybar-pomodoro dev` | Launches standalone mock UI with test hotkeys |
 | `waybar-pomodoro waybar` | Streams JSON status updates directly for Waybar |
 | `waybar-pomodoro toggle` | Starts or pauses the active countdown |
-| `waybar-pomodoro skip` | Skips to the next phase (Work ⇄ Break) |
+| `waybar-pomodoro skip` | Ends current session early (records actual work time in history) & advances phase |
 | `waybar-pomodoro reset` | Resets the current phase countdown to its start |
 | `waybar-pomodoro stop` | Stops the timer and resets back to Work phase (25:00) |
 | `waybar-pomodoro stats` | Displays today's completed session count and total focus time |

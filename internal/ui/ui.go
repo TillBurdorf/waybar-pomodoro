@@ -131,17 +131,13 @@ func RunUI() error {
 	updateGTK(waybar.Output{Mode: "work", Remaining: 25 * 60, Total: 25 * 60}, summary)
 
 	go func() {
-		lastStats := time.Now()
 		for {
 			select {
 			case <-done:
 				return
 			case state := <-updates:
-				if time.Since(lastStats) > 2*time.Second {
-					if current, err := stats.GetStats(); err == nil {
-						summary = current
-					}
-					lastStats = time.Now()
+				if current, err := stats.GetStats(); err == nil {
+					summary = current
 				}
 				updateGTK(state, summary)
 			}
@@ -228,7 +224,11 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 		if record.Mode == "break" {
 			phase = "Break"
 		}
-		history = fmt.Sprintf("Last: %s · %s (%d min)", record.Timestamp.Local().Format("15:04"), phase, record.Duration/60)
+		mins := record.Duration / 60
+		if mins <= 0 && record.Duration > 0 {
+			mins = 1
+		}
+		history = fmt.Sprintf("Last: %s · %s (%d min)", record.Timestamp.Local().Format("15:04"), phase, mins)
 	}
 	values := []string{
 		modeName,
@@ -253,7 +253,7 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 	var blockLines []string
 	for _, b := range summary.TodayBlocks {
 		durStr := stats.FormatDuration(b.Duration)
-		blockLines = append(blockLines, fmt.Sprintf("%d|%s|%s|%s", b.Index, b.StartTime, b.EndTime, durStr))
+		blockLines = append(blockLines, fmt.Sprintf("%d|%s|%s|%s|%s|%d", b.Index, b.StartTime, b.EndTime, durStr, b.Project, b.Duration))
 	}
 	todayBlocksC := C.CString(strings.Join(blockLines, "\n"))
 	defer C.free(unsafe.Pointer(todayBlocksC))
@@ -274,6 +274,26 @@ func updateGTK(state waybar.Output, summary stats.StatsSummary) {
 	defer C.free(unsafe.Pointer(weekDaysC))
 
 	C.pom_gtk_update_stats(todaySummaryC, todayBlocksC, weekSummaryC, weekDaysC)
+
+	allProjectsC := C.CString(strings.Join(summary.AllProjects, "\n"))
+	defer C.free(unsafe.Pointer(allProjectsC))
+
+	var projSumLines []string
+	for _, ps := range summary.ProjectSummaries {
+		projSumLines = append(projSumLines, fmt.Sprintf("%s|%d|%s|%d", ps.Name, ps.Minutes, ps.TimeStr, ps.SessionCount))
+	}
+	projSummariesC := C.CString(strings.Join(projSumLines, "\n"))
+	defer C.free(unsafe.Pointer(projSummariesC))
+
+	var pastSessLines []string
+	for _, ps := range summary.PastSessions {
+		durStr := stats.FormatDuration(ps.Duration)
+		pastSessLines = append(pastSessLines, fmt.Sprintf("%s|%s|%s|%s|%s", ps.DateStr, ps.StartTime, ps.EndTime, durStr, ps.Project))
+	}
+	pastSessionsC := C.CString(strings.Join(pastSessLines, "\n"))
+	defer C.free(unsafe.Pointer(pastSessionsC))
+
+	C.pom_gtk_update_projects(allProjectsC, projSummariesC, pastSessionsC)
 }
 
 func subscribeToDaemon(outChan chan<- waybar.Output, done <-chan struct{}) {
